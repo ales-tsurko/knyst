@@ -1,6 +1,6 @@
 [package]
 name = "knyst"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Real time dynamic audio graph and synthesis library"
@@ -17,11 +17,11 @@ features = ["jack", "cpal", "serde-derive"]
 [features]
 serde-derive = ["dep:serde"]
 debug-warn-on-alloc = ["assert_no_alloc/warn_debug"]
-default = ["cpal", "jack"]
+default = ["cpal", "jack", "assert_no_alloc"]
 unstable = []
 
 [dependencies]
-knyst_macro = "0.5.0"
+knyst_macro = "0.5.1"
 slotmap = "1.0"
 # For ergonomic error handling
 thiserror = "1.0"
@@ -33,7 +33,7 @@ fastapprox = "0.3"
 # Downcast used to have any user data in the Resources struct
 downcast-rs = "1.2.0"
 # JACK audio backend
-jack = { version = "0.11", optional = true }
+jack = { version = "0.13", optional = true }
 # CPAL audio backend
 cpal = { version = "0.15", optional = true }
 # Only for non real time use channels
@@ -43,9 +43,9 @@ symphonia = { version = "0.5.1", features = ["mp3"] }
 # Saving to wav
 hound = "3.5.1"
 serde = { version = "1.0", features = ["derive"], optional = true }
-assert_no_alloc = { version = "1.1.2" }
+assert_no_alloc = { version = "1.1.2", optional = true }
 num-traits = "0.2.17"
-itertools = "0.12.0"
+itertools = "0.13.0"
 
 # For concurrency testing
 [target.'cfg(loom)'.dependencies]
@@ -56,7 +56,7 @@ rand = "0.8"
 criterion = "0.5"
 anyhow = "1.0"
 dialog = "0.3"
-rfd = "0.12"
+rfd = "0.15.1"
 tokio = { version = "1.26.0", features = [
   "rt",
   "time",
@@ -81,14 +81,52 @@ path = "macro_tests/macro_tests_main.rs"
 name = "large_sine_graph"
 harness = false
 
+# Basic examples
 [[example]]
-name = "beat_callbacks"
-path = "examples/beat_callbacks.rs"
+name = "tone"
+path = "examples/basic/tone.rs"
 required-features = ["cpal"]
 
 [[example]]
-name = "simple_example"
-path = "examples/simple_example.rs"
+name = "tones"
+path = "examples/basic/tones.rs"
+required-features = ["cpal"]
+
+[[example]]
+name = "modulation"
+path = "examples/basic/modulation.rs"
+required-features = ["cpal"]
+
+[[example]]
+name = "adjust_frequency"
+path = "examples/basic/adjust_frequency.rs"
+required-features = ["cpal"]
+
+[[example]]
+name = "sound_file_playback"
+path = "examples/basic/sound_file_playback.rs"
+required-features = ["cpal"]
+
+[[example]]
+name = "scheduling"
+path = "examples/basic/scheduling.rs"
+required-features = ["cpal"]
+
+# Envelope examples
+[[example]]
+name = "volume_envelope"
+path = "examples/envelopes/volume_envelope.rs"
+required-features = ["cpal"]
+
+[[example]]
+name = "frequency_envelope"
+path = "examples/envelopes/frequency_envelope.rs"
+required-features = ["cpal"]
+
+# Advanced examples
+[[example]]
+name = "beat_callbacks"
+path = "examples/beat_callbacks.rs"
 required-features = ["cpal"]
 
 [[example]]
@@ -99,11 +137,6 @@ required-features = ["cpal"]
 [[example]]
 name = "interactive"
 path = "examples/interactive.rs"
-required-features = ["cpal"]
-
-[[example]]
-name = "sound_file_playback"
-path = "examples/sound_file_playback.rs"
 required-features = ["cpal"]
 
 [[example]]

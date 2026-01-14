@@ -40,10 +40,11 @@
 //! ## Features
 //!
 //! - *unstable*: Enables unstable optimisations in some cases that currently requires nightly.
+//! - *assert_no_alloc*: (default) Panics in debug builds if an allocation is detected on the audio thread.
 //! - *debug-warn-on-alloc*: Print a warning instead of panicing when allocating on the audio thread (debug build only).
 //! - *serde-derive*: Enables some data structures to be serialized/deserialized using serde.
-//! - *cpal*: Enables the cpal AudioBackend
-//! - *jack*: Enables the JACK AudioBackend
+//! - *cpal*: (default) Enables the cpal AudioBackend
+//! - *jack*: (default) Enables the JACK AudioBackend
 //!
 #![deny(rustdoc::broken_intra_doc_links)] // error if there are broken intra-doc links
 #![warn(missing_docs)]
@@ -70,9 +71,10 @@ pub use resources::Resources;
 // assert_no_alloc to make sure we are not allocating on the audio thread. The
 // assertion is put in AudioBackend.
 #[allow(unused_imports)]
+#[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
 use assert_no_alloc::*;
 
-#[cfg(debug_assertions)] // required when disable_release is set (default)
+#[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
 #[global_allocator]
 static A: AllocDisabler = AllocDisabler;
 
@@ -95,6 +97,7 @@ pub mod sphere;
 pub mod time;
 pub mod trig;
 pub mod wavetable;
+pub mod wavetable_aa;
 pub mod xorrng;
 
 /// Combined error type for Knyst, containing any other error in the library.
@@ -147,7 +150,7 @@ pub type Trig = Sample;
 
 /// Newtype for a sample rate to identify it in function signatures. Derefs to a `Sample` for easy use on the audio thread.
 #[derive(Copy, Clone, Debug)]
-pub struct SampleRate(Sample);
+pub struct SampleRate(pub Sample);
 
 impl SampleRate {
     #[inline(always)]
@@ -197,7 +200,7 @@ impl From<f64> for SampleRate {
 /// BlockSize.
 ///
 /// Can be an unorthodox block size value in the event of a partial block at the beginning of a node's existence in the graph.
-pub struct BlockSize(usize);
+pub struct BlockSize(pub usize);
 
 impl From<BlockSize> for usize {
     #[inline(always)]
