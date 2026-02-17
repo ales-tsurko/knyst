@@ -85,7 +85,7 @@ fn main() -> Result<()> {
             .default_graph_settings()
             .oversampling(knyst::graph::Oversampling::X2),
         || {},
-    );
+    )?;
 
     let sub_graph_id = sub_graph.graph_id();
     graph_output(0, sub_graph);

@@ -57,7 +57,10 @@ pub(super) fn make_graph_gen(
     // Then convert block size if necessary.
     let graph_gen: Box<dyn Gen + Send + 'static> = if oversampling != parent_oversampling {
         if num_inputs > 0 {
-            panic!("Oversampling is currently not implemented for Graphs with inputs. This will be supported in the future.");
+            eprintln!(
+                "Error: oversampling conversion for graphs with inputs is not supported. Running inner graph without conversion."
+            );
+            return graph_gen;
         }
         let graph_oversampling_converter = GraphConvertOversampling2XGen::new(
             Node::new("GraphConvertOversamplingGen", graph_gen),
@@ -73,7 +76,10 @@ pub(super) fn make_graph_gen(
     };
     if parent_block_size != block_size {
         if parent_block_size < block_size && num_inputs > 0 {
-            panic!("An inner Graph cannot have inputs if it has a larger block size since the inputs will not be sufficiently filled.");
+            eprintln!(
+                "Error: inner graph block size is larger than parent and has inputs. Running inner graph without block-size conversion."
+            );
+            return graph_gen;
         }
         let graph_block_converter_gen = GraphBlockConverterGen::new(
             Node::new("GraphBlockConverterGen", graph_gen),

@@ -209,16 +209,24 @@ pub trait KnystCommands {
     fn upload_scheduling_bundle(&mut self);
 }
 
+/// Error from using [`upload_graph`].
+#[derive(thiserror::Error, Debug)]
+pub enum UploadGraphError {
+    /// No local graph was available to upload.
+    #[error("No local graph was available to upload.")]
+    LocalGraphMissing,
+}
+
 /// Create a new local graph, runs the init function to let you build it, and then uploads it to the active Sphere.
 pub fn upload_graph(
     settings: GraphSettings,
     init: impl FnOnce(),
-) -> crate::handles::Handle<crate::handles::GraphHandle> {
+) -> Result<crate::handles::Handle<crate::handles::GraphHandle>, UploadGraphError> {
     knyst_commands().init_local_graph(settings);
     init();
     knyst_commands()
         .upload_local_graph()
-        .expect("`upload_graph` initiated a local graph so it should exist")
+        .ok_or(UploadGraphError::LocalGraphMissing)
 }
 
 /// Schedules any changes made in the closure at the given time. Currently limited to changes of constant values and spawning new nodes, not new connections.
@@ -1196,13 +1204,16 @@ mod tests {
         let mut ignored_graph_node = None;
         let _ignored_graph = upload_graph(knyst_commands().default_graph_settings(), || {
             ignored_graph_node = Some(one_gen());
-        });
+        })
+        .expect("test graph upload should succeed");
         let mut inner_graph = None;
         let graph = upload_graph(knyst_commands().default_graph_settings(), || {
-            let g = upload_graph(knyst_commands().default_graph_settings(), || ());
+            let g = upload_graph(knyst_commands().default_graph_settings(), || ())
+                .expect("test graph upload should succeed");
             graph_output(0, g);
             inner_graph = Some(g);
-        });
+        })
+        .expect("test graph upload should succeed");
         graph_output(0, graph);
         inner_graph.unwrap().activate();
         schedule_bundle(crate::graph::Time::Immediately, || {

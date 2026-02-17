@@ -94,7 +94,7 @@ impl IntervalTrig {
                 self.counter = self
                     .counter
                     .checked_sub(interval_as_seconds)
-                    .expect("Counter was checked to be bigger than or equal to the interval so the subtraction should always work.");
+                    .unwrap_or(Seconds::ZERO);
                 1.0
             } else {
                 0.0

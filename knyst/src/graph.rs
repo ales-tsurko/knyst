@@ -595,6 +595,29 @@ pub enum PushError {
         g: GenOrGraphEnum,
         target_graph: GraphId,
     },
+    #[error("Failed to create graph generator: {0}")]
+    GraphGenCreationFailed(String),
+    #[error(
+        "Inner graph with block size {inner_block_size} cannot have inputs when parent block size is {parent_block_size}."
+    )]
+    InnerGraphInputsWithLargerBlockSize {
+        inner_block_size: usize,
+        parent_block_size: usize,
+    },
+    #[error(
+        "Inner graph oversampling {inner_oversampling:?} must be greater than or equal to parent oversampling {parent_oversampling:?}."
+    )]
+    InnerGraphLowerOversampling {
+        inner_oversampling: Oversampling,
+        parent_oversampling: Oversampling,
+    },
+    #[error(
+        "Oversampling conversion for inner graphs with inputs is not supported. Inner oversampling: {inner_oversampling:?}, parent oversampling: {parent_oversampling:?}."
+    )]
+    InnerGraphInputsWithOversamplingConversion {
+        inner_oversampling: Oversampling,
+        parent_oversampling: Oversampling,
+    },
 }
 
 /// Error freeing a node in a Graph
@@ -661,9 +684,9 @@ impl GenOrGraphEnum {
         parent_graph_block_size: usize,
         parent_graph_sample_rate: Sample,
         parent_graph_oversampling: Oversampling,
-    ) -> (Option<Graph>, Box<dyn Gen + Send>) {
+    ) -> Result<(Option<Graph>, Box<dyn Gen + Send>), PushError> {
         match self {
-            GenOrGraphEnum::Gen(boxed_gen) => (None, boxed_gen),
+            GenOrGraphEnum::Gen(boxed_gen) => Ok((None, boxed_gen)),
             GenOrGraphEnum::Graph(graph) => graph.components(
                 parent_graph_block_size,
                 parent_graph_sample_rate,
@@ -702,7 +725,7 @@ pub trait GenOrGraph {
         parent_graph_block_size: usize,
         parent_graph_sample_rate: Sample,
         parent_graph_oversampling: Oversampling,
-    ) -> (Option<Graph>, Box<dyn Gen + Send>);
+    ) -> Result<(Option<Graph>, Box<dyn Gen + Send>), PushError>;
     fn into_gen_or_graph_enum(self) -> GenOrGraphEnum;
     fn num_outputs(&self) -> usize;
     fn num_inputs(&self) -> usize;
@@ -714,8 +737,8 @@ impl<T: Gen + Send + 'static> GenOrGraph for T {
         _parent_graph_block_size: usize,
         _parent_graph_sample_rate: Sample,
         _parent_graph_oversampling: Oversampling,
-    ) -> (Option<Graph>, Box<dyn Gen + Send>) {
-        (None, Box::new(self))
+    ) -> Result<(Option<Graph>, Box<dyn Gen + Send>), PushError> {
+        Ok((None, Box::new(self)))
     }
     fn into_gen_or_graph_enum(self) -> GenOrGraphEnum {
         GenOrGraphEnum::Gen(Box::new(self))
@@ -743,11 +766,12 @@ impl GenOrGraph for Graph {
         parent_graph_block_size: usize,
         parent_graph_sample_rate: Sample,
         parent_graph_oversampling: Oversampling,
-    ) -> (Option<Graph>, Box<dyn Gen + Send>) {
+    ) -> Result<(Option<Graph>, Box<dyn Gen + Send>), PushError> {
         if self.block_size() > parent_graph_block_size && self.num_inputs() > 0 {
-            panic!(
-                "Warning: You are pushing a graph with a larger block size and with Graph inputs. An inner Graph with a larger block size cannot have inputs since the inputs for the entire inner block would not have been calculated yet."
-            );
+            return Err(PushError::InnerGraphInputsWithLargerBlockSize {
+                inner_block_size: self.block_size(),
+                parent_block_size: parent_graph_block_size,
+            });
         }
         if self.sample_rate != parent_graph_sample_rate {
             eprintln!(
@@ -755,9 +779,16 @@ impl GenOrGraph for Graph {
             );
         }
         if self.oversampling.as_usize() < parent_graph_oversampling.as_usize() {
-            panic!(
-                "You tried to push an inner graph with lower oversampling than its parent. This is not currently allowed."
-            );
+            return Err(PushError::InnerGraphLowerOversampling {
+                inner_oversampling: self.oversampling,
+                parent_oversampling: parent_graph_oversampling,
+            });
+        }
+        if self.oversampling != parent_graph_oversampling && self.num_inputs() > 0 {
+            return Err(PushError::InnerGraphInputsWithOversamplingConversion {
+                inner_oversampling: self.oversampling,
+                parent_oversampling: parent_graph_oversampling,
+            });
         }
         // Create the GraphGen from the new Graph
         let gen = self
@@ -766,8 +797,8 @@ impl GenOrGraph for Graph {
                 parent_graph_sample_rate,
                 parent_graph_oversampling,
             )
-            .unwrap();
-        (Some(self), gen)
+            .map_err(PushError::GraphGenCreationFailed)?;
+        Ok((Some(self), gen))
     }
     fn into_gen_or_graph_enum(self) -> GenOrGraphEnum {
         GenOrGraphEnum::Graph(self)
@@ -1364,7 +1395,7 @@ impl Graph {
             let (graph, gen) =
                 to_node
                     .into()
-                    .components(self.block_size, self.sample_rate, self.oversampling);
+                    .components(self.block_size, self.sample_rate, self.oversampling)?;
             let mut start_timestamp = 0;
 
             let mut scheduler_ts = false;
@@ -1580,29 +1611,31 @@ impl Graph {
         }
         self.recalculation_required = true;
 
-        let num_inputs = self.node_input_index_to_name
-                .get(node_key)
-                .expect(
-                    "Since the key exists in the Graph it should have a corresponding node_input_index_to_name Vec"
-                )
-                .len();
-        let num_outputs = self.node_output_index_to_name
-                .get(node_key)
-                .expect(
-                    "Since the key exists in the Graph it should have a corresponding node_output_index_to_name Vec"
-                )
-                .len();
+        let Some(node_inputs) = self.node_input_index_to_name.get(node_key) else {
+            return Err(FreeError::NodeNotFound);
+        };
+        let num_inputs = node_inputs.len();
+        let Some(node_outputs) = self.node_output_index_to_name.get(node_key) else {
+            return Err(FreeError::NodeNotFound);
+        };
+        let num_outputs = node_outputs.len();
         let inputs_to_bridge = num_inputs.min(num_outputs);
         // First collect all the connections that should be bridged so that they are in one place
         let mut outputs = vec![vec![]; inputs_to_bridge];
         for (destination_node_key, edge_vec) in &self.node_input_edges {
             for edge in edge_vec {
                 if edge.source == node_key && edge.from_output_index < inputs_to_bridge {
+                    let Some(source_id) = self.id_from_key(node_key) else {
+                        return Err(FreeError::NodeNotFound);
+                    };
+                    let Some(sink_id) = self.id_from_key(destination_node_key) else {
+                        return Err(FreeError::NodeNotFound);
+                    };
                     outputs[edge.from_output_index].push(Connection::Node {
-                        source: self.id_from_key(node_key).unwrap(),
+                        source: source_id,
                         from_index: Some(edge.from_output_index),
                         from_label: None,
-                        sink: self.id_from_key(destination_node_key).unwrap(),
+                        sink: sink_id,
                         to_index: Some(edge.to_input_index),
                         to_label: None,
                         channels: 1,
@@ -1615,8 +1648,11 @@ impl Graph {
         for graph_output in &self.output_edges {
             if graph_output.source == node_key && graph_output.from_output_index < inputs_to_bridge
             {
+                let Some(source_id) = self.id_from_key(node_key) else {
+                    return Err(FreeError::NodeNotFound);
+                };
                 outputs[graph_output.from_output_index].push(Connection::GraphOutput {
-                    source: self.id_from_key(node_key).unwrap(),
+                    source: source_id,
                     from_index: Some(graph_output.from_output_index),
                     from_label: None,
                     to_index: graph_output.to_input_index,
@@ -1626,25 +1662,26 @@ impl Graph {
         }
         let mut inputs = vec![vec![]; inputs_to_bridge];
         for (inout_index, bridge_input) in inputs.iter_mut().enumerate().take(inputs_to_bridge) {
-            for input in self
-                .node_input_edges
-                .get(node_key)
-                .expect("Since the key exists in the Graph its edge Vec should also exist")
-            {
+            let Some(node_input_edges) = self.node_input_edges.get(node_key) else {
+                return Err(FreeError::NodeNotFound);
+            };
+            for input in node_input_edges {
                 if input.to_input_index == inout_index {
                     bridge_input.push(*input);
                 }
             }
         }
         let mut graph_inputs = vec![vec![]; inputs_to_bridge];
-        for graph_input in self
-            .graph_input_edges
-            .get(node_key)
-            .expect("Since the key exists in the graph its graph input Vec should also exist")
-        {
+        let Some(graph_input_edges) = self.graph_input_edges.get(node_key) else {
+            return Err(FreeError::NodeNotFound);
+        };
+        for graph_input in graph_input_edges {
             if graph_input.to_input_index < inputs_to_bridge {
+                let Some(sink_id) = self.id_from_key(node_key) else {
+                    return Err(FreeError::NodeNotFound);
+                };
                 graph_inputs[graph_input.to_input_index].push(Connection::GraphInput {
-                    sink: self.id_from_key(node_key).unwrap(),
+                    sink: sink_id,
                     from_index: graph_input.from_output_index,
                     to_index: Some(graph_input.to_input_index),
                     to_label: None,
@@ -1659,15 +1696,21 @@ impl Graph {
                 for output in outputs {
                     // We are not certain that the input node has as many
                     // outputs as the node being freed.
-                    let num_node_outputs =
-                        self.get_nodes().get(input.source).unwrap().num_outputs();
+                    let Some(input_node) = self.get_nodes().get(input.source) else {
+                        return Err(FreeError::NodeNotFound);
+                    };
+                    let num_node_outputs = input_node.num_outputs();
                     let mut connection = output.clone();
                     if let Some(connection_from_index) = connection.get_from_index() {
                         connection =
                             connection.from_index(connection_from_index % num_node_outputs);
                     }
-                    self.connect(connection.from(self.id_from_key(input.source).unwrap()))
-                        .expect("Mended connections should be guaranteed to succeed");
+                    let Some(source_id) = self.id_from_key(input.source) else {
+                        return Err(FreeError::NodeNotFound);
+                    };
+                    if let Err(e) = self.connect(connection.from(source_id)) {
+                        return Err(FreeError::ConnectionError(Box::new(e)));
+                    }
                 }
             }
         }
@@ -1675,11 +1718,13 @@ impl Graph {
             for input in graph_inputs {
                 for output in outputs {
                     let connection = input.clone();
-                    match self.connect(
-                        connection
-                            .to(output.get_source_node().unwrap())
-                            .to_index(output.get_to_index().unwrap()),
-                    ) {
+                    let Some(source_node) = output.get_source_node() else {
+                        continue;
+                    };
+                    let Some(to_index) = output.get_to_index() else {
+                        continue;
+                    };
+                    match self.connect(connection.to(source_node).to_index(to_index)) {
                         Ok(_) => (),
                         Err(e) => {
                             return Err(FreeError::ConnectionError(Box::new(e)));
@@ -1904,26 +1949,17 @@ impl Graph {
 
             nodes.push(NodeInspection {
                 name: node.name.to_string(),
-                address: self.node_ids
+                address: *self.node_ids.get(node_key).unwrap_or(&NodeId::new(self.id)),
+                input_channels: self
+                    .node_input_index_to_name
                     .get(node_key)
-                    .expect("All nodes should have their ids stored.")
-                    .clone(),
-                input_channels: self.node_input_index_to_name
+                    .map(|channels| channels.iter().map(|&s| s.to_string()).collect())
+                    .unwrap_or_default(),
+                output_channels: self
+                    .node_output_index_to_name
                     .get(node_key)
-                    .expect(
-                        "All nodes should have a list of input channel names made when pushed to the graph."
-                    )
-                    .iter()
-                    .map(|&s| s.to_string())
-                    .collect(),
-                output_channels: self.node_output_index_to_name
-                    .get(node_key)
-                    .expect(
-                        "All nodes should have a list of output channel names made when pushed to the graph."
-                    )
-                    .iter()
-                    .map(|&s| s.to_string())
-                    .collect(),
+                    .map(|channels| channels.iter().map(|&s| s.to_string()).collect())
+                    .unwrap_or_default(),
                 // Leave empty for now, fill later
                 input_edges: vec![],
                 graph_inspection,
@@ -3634,9 +3670,8 @@ impl Graph {
                 dump.push(NodeDump::Node(
                     nodes
                         .get(key)
-                        .expect("key from `nodes` should still be valid, but isn't")
-                        .name
-                        .to_string(),
+                        .map(|node| node.name.to_string())
+                        .unwrap_or_else(|| "<missing-node>".to_string()),
                 ));
             }
         }

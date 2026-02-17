@@ -147,7 +147,8 @@ impl StandardDownsampler2X {
                 5,
             ),
             _ => {
-                panic!("Incorrect order in Oversampler")
+                eprintln!("Warning: unsupported oversampler order, falling back to order 2");
+                (vec![0.23647102099689224, 0.7145421497126001], 1)
             }
         };
         let downsampler = Downsampler2X::new(coefficients);

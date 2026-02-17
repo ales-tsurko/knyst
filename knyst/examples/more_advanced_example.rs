@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     // Output delay with a small additional delay to create a rudimentary stereo illusion
     graph_output(0, (delay + static_sample_delay(87).input(delay)) * 0.5);
     graph_output(1, (delay + static_sample_delay(62).input(delay)) * 0.5);
-    let outer_graph = upload_graph(knyst_commands().default_graph_settings(), || {});
+    let outer_graph = upload_graph(knyst_commands().default_graph_settings(), || {})?;
     // Nothing is passed into the delay until now. Pass any output of the "outer_graph" into the delay.
     delay.input(outer_graph);
     // Make the "outer_graph" the active graph, meaning any new nodes are pushed to it.
@@ -78,7 +78,8 @@ fn main() -> Result<()> {
                     // let sig = sig * handle(env.to_gen());
                     graph_output(0, sig.repeat_outputs(1));
                 },
-            );
+            )
+            .expect("failed to upload graph");
             // Make sure we also pass the freq_var signal in
             graph.set(0, freq_var);
             outer_graph.activate();
@@ -112,7 +113,8 @@ fn main() -> Result<()> {
                         // let sig = sig * handle(env.to_gen());
                         graph_output(0, sig.repeat_outputs(1));
                     },
-                );
+                )
+                .expect("failed to upload graph");
                 // Make sure we also pass the freq_var signal in
                 graph.set(0, freq_var);
                 outer_graph.activate();

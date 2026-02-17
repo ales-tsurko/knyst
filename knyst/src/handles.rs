@@ -470,7 +470,15 @@ pub trait HandleData {
             NodeChannel::Index(i) => {
                 let (source, chan) = self.out_channels().nth(i).unwrap();
                 match source {
-                    Source::GraphInput(_graph_id) => todo!(),
+                    Source::GraphInput(graph_id) => {
+                        eprintln!(
+                            "Warning: `Handle::out` called on a graph input source. Returning a placeholder handle."
+                        );
+                        Handle::new(OutputChannelHandle {
+                            node_id: NodeId::new(graph_id),
+                            channel: chan,
+                        })
+                    }
                     Source::Gen(node_id) => Handle::new(OutputChannelHandle {
                         node_id,
                         channel: chan,
@@ -490,7 +498,15 @@ pub trait HandleData {
             NodeChannel::Index(i) => {
                 let (source, chan) = self.out_channels().nth(i).unwrap();
                 match source {
-                    Source::GraphInput(_graph_id) => todo!(),
+                    Source::GraphInput(graph_id) => {
+                        eprintln!(
+                            "Warning: `Handle::input_handle` called on a graph input source. Returning a placeholder handle."
+                        );
+                        Handle::new(InputChannelHandle {
+                            source: Sink::GraphOutput(graph_id),
+                            channel: chan,
+                        })
+                    }
                     Source::Gen(node_id) => Handle::new(InputChannelHandle {
                         source: Sink::Gen(node_id),
                         channel: chan,
@@ -1509,12 +1525,9 @@ pub fn graph_output(index: usize, input: impl Into<Input>) {
     let inp = input.into();
     match inp {
         Input::Constant(_v) => {
-            // commands().connect(
-            //     crate::graph::connection::constant(v)
-            //         .to_graph_out()
-            //         .to_channel(index),
-            // );
-            todo!()
+            eprintln!(
+                "Error: constants cannot be connected directly to graph outputs. Use a node handle as source."
+            );
         }
         Input::Handle { output_channels } => {
             for (i, (node_id, chan)) in output_channels.enumerate() {

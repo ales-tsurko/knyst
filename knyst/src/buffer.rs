@@ -32,6 +32,15 @@ use super::Sample;
 pub enum BufferError {
     #[error("Tried to load a file in an unsupported format: {0}")]
     FileFormatNotSupported(PathBuf),
+    #[error("Unable to open sound file: {path}. {source}")]
+    FileOpenError {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("No supported audio tracks found in file: {0}")]
+    NoSupportedAudioTracks(PathBuf),
+    #[error("Unsupported codec for file: {0}")]
+    UnsupportedCodec(PathBuf),
     #[error("Symphonia error: {0}")]
     SymphoniaError(#[from] SymphoniaError),
 }
@@ -93,7 +102,10 @@ impl Buffer {
     pub fn from_sound_file(path: impl Into<PathBuf>) -> Result<Self, BufferError> {
         let path = path.into();
         let mut buffer = Vec::new();
-        let inp_file = File::open(&path).expect("Buffer: failed to open file!");
+        let inp_file = File::open(&path).map_err(|source| BufferError::FileOpenError {
+            path: path.clone(),
+            source,
+        })?;
         // hint to the format registry of the decoder what file format it might be
         let mut hint = Hint::new();
         // Provide the file extension as a hint.
@@ -122,7 +134,7 @@ impl Buffer {
                     .tracks()
                     .iter()
                     .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-                    .expect("no supported audio tracks");
+                    .ok_or_else(|| BufferError::NoSupportedAudioTracks(path.clone()))?;
                 // Set the decoder options.
                 let decode_options = DecoderOptions {
                     ..Default::default()
@@ -131,7 +143,7 @@ impl Buffer {
                 // Create a decoder for the stream.
                 let mut decoder = symphonia::default::get_codecs()
                     .make(&track.codec_params, &decode_options)
-                    .expect("unsupported codec");
+                    .map_err(|_| BufferError::UnsupportedCodec(path.clone()))?;
                 let codec_params = track.codec_params.clone();
                 // Store the track identifier, it will be used to filter packets.
                 let track_id = track.id;
@@ -146,18 +158,14 @@ impl Buffer {
                             // then restart the decode loop. This is an advanced feature and it is not
                             // unreasonable to consider this "the end." As of v0.5.0, the only usage of this is
                             // for chained OGG physical streams.
-                            unimplemented!();
+                            return Err(BufferError::SymphoniaError(SymphoniaError::ResetRequired));
                         }
                         Err(err) => match err {
                             SymphoniaError::IoError(_e) => {
                                 // println!("{e}");
                                 break;
                             }
-                            SymphoniaError::DecodeError(_) => todo!(),
-                            SymphoniaError::SeekError(_) => todo!(),
-                            SymphoniaError::Unsupported(_) => todo!(),
-                            SymphoniaError::LimitError(_) => todo!(),
-                            SymphoniaError::ResetRequired => todo!(),
+                            other => return Err(BufferError::SymphoniaError(other)),
                         },
                     };
 
