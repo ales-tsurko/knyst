@@ -406,7 +406,7 @@ impl EnvelopeGen {
     }
     /// Evaluate [`Self`] as an iterator. Evaluating the envelope means changing
     /// the state which is why it is mut.
-    pub fn iter_mut(&mut self) -> EnvelopeIterator {
+    pub fn iter_mut(&mut self) -> EnvelopeIterator<'_> {
         EnvelopeIterator { envelope: self }
     }
 }

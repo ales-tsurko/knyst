@@ -176,7 +176,7 @@ impl NodeBufferRef {
         self.block_size - self.block_start_offset
     }
     /// Returns an iterator to the channels in this NodeBufferRef
-    pub fn iter(&mut self) -> NodeBufferRefIter {
+    pub fn iter(&mut self) -> NodeBufferRefIter<'_> {
         NodeBufferRefIter {
             buf: self.buf,
             num_channels: self.num_channels,
@@ -186,7 +186,7 @@ impl NodeBufferRef {
         }
     }
     /// Returns an iterator to the channels in this NodeBufferRef
-    pub fn iter_mut(&mut self) -> NodeBufferRefIterMut {
+    pub fn iter_mut(&mut self) -> NodeBufferRefIterMut<'_> {
         NodeBufferRefIterMut {
             buf: self.buf,
             num_channels: self.num_channels,

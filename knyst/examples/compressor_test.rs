@@ -1,8 +1,7 @@
 use anyhow::Result;
 use knyst::audio_backend::{CpalBackend, CpalBackendOptions};
 use knyst::{
-    audio_backend::JackBackend, controller::print_error_handler,
-    gen::dynamics::randja_compressor::RandjaCompressor, prelude::*,
+    controller::print_error_handler, gen::dynamics::randja_compressor::RandjaCompressor, prelude::*,
 };
 
 fn main() -> Result<()> {
