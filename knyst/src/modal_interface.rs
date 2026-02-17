@@ -17,6 +17,7 @@ use std::rc::Rc;
 use std::sync::{atomic::AtomicU16, Mutex};
 
 use crate::audio_backend::AudioBackendError;
+use crate::resources::ResourcesError;
 use crate::resources::{BufferId, WavetableId};
 
 use crate::controller::KnystCommands;
@@ -457,6 +458,9 @@ pub enum SphereError {
     /// There was an error in the audio backend
     #[error("Audio backend error: {0}")]
     AudioBackendError(#[from] AudioBackendError),
+    /// There was an error initialising resources
+    #[error("Resources error: {0}")]
+    ResourcesError(#[from] ResourcesError),
 }
 
 // pub fn test_using() {

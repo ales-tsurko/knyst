@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     let block_size = backend.block_size().unwrap_or(64);
     let resources = Resources::new(ResourcesSettings {
         ..Default::default()
-    });
+    })?;
     let graph: Graph = Graph::new(GraphSettings {
         block_size,
         sample_rate,

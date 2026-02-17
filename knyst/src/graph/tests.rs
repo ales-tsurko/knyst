@@ -50,7 +50,8 @@ fn test_resources_settings() -> ResourcesSettings {
     ResourcesSettings::default()
 }
 fn test_run_graph(graph: &mut Graph, settings: RunGraphSettings) -> RunGraph {
-    let resources = Resources::new(test_resources_settings());
+    let resources =
+        Resources::new(test_resources_settings()).expect("test resources should initialize");
     let (run_graph, _, _) = RunGraph::new(graph, resources, settings).unwrap();
     run_graph
 }
@@ -760,7 +761,8 @@ fn sending_buffer_to_resources() {
         max_wavetables: 0,
         max_buffers: 3,
         max_user_data: 0,
-    });
+    })
+    .expect("test resources should initialize");
     let (mut run_graph, resources_command_sender, resources_response_receiver) = RunGraph::new(
         &mut graph,
         resources,
@@ -895,7 +897,7 @@ fn beat_scheduling() {
     graph.connect(node.to_graph_out()).unwrap();
     let (mut run_graph, _, _) = RunGraph::new(
         &mut graph,
-        Resources::new(ResourcesSettings::default()),
+        Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
         RunGraphSettings {
             scheduling_latency: Duration::new(0, 0),
         },
@@ -995,7 +997,7 @@ fn inner_graph_different_block_size() {
     graph.update();
     let (mut run_graph, _, _) = RunGraph::new(
         &mut graph,
-        Resources::new(ResourcesSettings::default()),
+        Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
         RunGraphSettings {
             scheduling_latency: Duration::new(0, 0),
         },
@@ -1074,7 +1076,7 @@ fn inner_graph_different_oversampling() {
     graph.update();
     let (mut run_graph, _, _) = RunGraph::new(
         &mut graph,
-        Resources::new(ResourcesSettings::default()),
+        Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
         RunGraphSettings {
             scheduling_latency: Duration::new(0, 0),
         },

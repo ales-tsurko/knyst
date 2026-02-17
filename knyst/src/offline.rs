@@ -119,6 +119,9 @@ impl AudioBackend for OfflineBackend {
         run_graph_settings: crate::graph::RunGraphSettings,
         error_handler: Box<dyn FnMut(crate::KnystError) + Send + 'static>,
     ) -> Result<crate::controller::Controller, crate::audio_backend::AudioBackendError> {
+        if self.run_graph.is_some() {
+            return Err(crate::audio_backend::AudioBackendError::BackendAlreadyRunning);
+        }
         let (run_graph, resources_command_sender, resources_command_receiver) =
             RunGraph::new(&mut graph, resources, run_graph_settings)?;
         let controller = Controller::new(
@@ -132,7 +135,11 @@ impl AudioBackend for OfflineBackend {
     }
 
     fn stop(&mut self) -> Result<(), crate::audio_backend::AudioBackendError> {
-        todo!()
+        if self.run_graph.take().is_some() {
+            Ok(())
+        } else {
+            Err(crate::audio_backend::AudioBackendError::BackendNotRunning)
+        }
     }
 
     fn sample_rate(&self) -> usize {
@@ -149,5 +156,88 @@ impl AudioBackend for OfflineBackend {
 
     fn native_input_channels(&self) -> Option<usize> {
         Some(self.num_inputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OfflineBackend;
+    use crate::{
+        audio_backend::{AudioBackend, AudioBackendError},
+        graph::{Graph, GraphSettings, RunGraphSettings},
+        resources::ResourcesSettings,
+        Resources,
+    };
+
+    fn test_graph(sample_rate: usize, block_size: usize, num_outputs: usize) -> Graph {
+        Graph::new(GraphSettings {
+            sample_rate: sample_rate as crate::Sample,
+            block_size,
+            num_inputs: 0,
+            num_outputs,
+            ..Default::default()
+        })
+    }
+
+    fn test_resources() -> Resources {
+        Resources::new(ResourcesSettings::default()).expect("test resources should initialize")
+    }
+
+    #[test]
+    fn offline_backend_start_twice_returns_already_running() {
+        let mut backend = OfflineBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        let first = backend.start_processing_return_controller(
+            test_graph(44_100, 64, 2),
+            test_resources(),
+            RunGraphSettings::default(),
+            Box::new(|_| {}),
+        );
+        assert!(first.is_ok());
+
+        let second = backend.start_processing_return_controller(
+            test_graph(44_100, 64, 2),
+            test_resources(),
+            RunGraphSettings::default(),
+            Box::new(|_| {}),
+        );
+        assert!(matches!(
+            second,
+            Err(AudioBackendError::BackendAlreadyRunning)
+        ));
+    }
+
+    #[test]
+    fn offline_backend_stop_twice_returns_not_running() {
+        let mut backend = OfflineBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        let started = backend.start_processing_return_controller(
+            test_graph(44_100, 64, 2),
+            test_resources(),
+            RunGraphSettings::default(),
+            Box::new(|_| {}),
+        );
+        assert!(started.is_ok());
+
+        let first_stop = backend.stop();
+        assert!(first_stop.is_ok());
+
+        let second_stop = backend.stop();
+        assert!(matches!(
+            second_stop,
+            Err(AudioBackendError::BackendNotRunning)
+        ));
     }
 }

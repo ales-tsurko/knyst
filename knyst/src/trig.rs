@@ -137,7 +137,7 @@ mod tests {
             .unwrap();
         let (mut run_graph, _, _) = RunGraph::new(
             &mut graph,
-            Resources::new(ResourcesSettings::default()),
+            Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
             RunGraphSettings {
                 scheduling_latency: Duration::new(0, 0),
             },

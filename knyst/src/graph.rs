@@ -1043,7 +1043,7 @@ impl Drop for OwnedRawBuffer {
 ///     ..Default::default()
 /// };
 /// let mut graph = Graph::new(graph_settings);
-/// let resources = Resources::new(ResourcesSettings::default());
+/// let resources = Resources::new(ResourcesSettings::default())?;
 /// let (mut run_graph, _, _) = RunGraph::new(&mut graph, resources, RunGraphSettings::default())?;
 /// // Adding a node gives you an address to that node
 /// let sine_node_address = graph.push(WavetableOscillatorOwned::new(Wavetable::sine()));
@@ -4197,7 +4197,7 @@ struct FeedbackEdge {
 ///     ..Default::default()
 /// };
 /// let mut graph = Graph::new(graph_settings);
-/// let resources = Resources::new(ResourcesSettings::default());
+/// let resources = Resources::new(ResourcesSettings::default())?;
 /// let (mut run_graph, _, _) = RunGraph::new(&mut graph, resources, RunGraphSettings::default())?;
 /// let mult = graph.push(Mult);
 /// // Connecting the node to the graph output

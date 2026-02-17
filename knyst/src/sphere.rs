@@ -29,7 +29,7 @@ impl KnystSphere {
         settings: SphereSettings,
         error_handler: impl FnMut(KnystError) + Send + 'static,
     ) -> Result<SphereId, SphereError> {
-        let resources = Resources::new(settings.resources_settings);
+        let resources = Resources::new(settings.resources_settings)?;
         let graph_settings = GraphSettings {
             name: settings.name.clone(),
             num_inputs: backend
@@ -68,7 +68,7 @@ impl KnystSphere {
         settings: SphereSettings,
         error_handler: impl FnMut(KnystError) + Send + 'static,
     ) -> Result<(SphereId, Controller), SphereError> {
-        let resources = Resources::new(settings.resources_settings);
+        let resources = Resources::new(settings.resources_settings)?;
         let graph_settings = GraphSettings {
             name: settings.name.clone(),
             num_inputs: backend
@@ -137,6 +137,102 @@ impl Default for SphereSettings {
             num_inputs: 2,
             num_outputs: 2,
             scheduling_ring_buffer_capacity: 1000,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KnystSphere, SphereSettings};
+    use crate::{
+        audio_backend::{AudioBackend, AudioBackendError},
+        graph::{Graph, RunGraphSettings},
+        modal_interface::SphereError,
+        resources::{Resources, ResourcesError, ResourcesSettings},
+        KnystError,
+    };
+
+    struct DummyBackend;
+
+    impl AudioBackend for DummyBackend {
+        fn start_processing_return_controller(
+            &mut self,
+            _graph: Graph,
+            _resources: Resources,
+            _run_graph_settings: RunGraphSettings,
+            _error_handler: Box<dyn FnMut(KnystError) + Send + 'static>,
+        ) -> Result<crate::controller::Controller, AudioBackendError> {
+            panic!("backend should not start when resources initialization fails");
+        }
+
+        fn stop(&mut self) -> Result<(), AudioBackendError> {
+            Ok(())
+        }
+
+        fn sample_rate(&self) -> usize {
+            44_100
+        }
+
+        fn block_size(&self) -> Option<usize> {
+            Some(64)
+        }
+
+        fn native_output_channels(&self) -> Option<usize> {
+            Some(2)
+        }
+
+        fn native_input_channels(&self) -> Option<usize> {
+            Some(0)
+        }
+    }
+
+    fn failing_resources_settings() -> ResourcesSettings {
+        ResourcesSettings {
+            max_wavetables: usize::MAX,
+            max_buffers: 1,
+            max_user_data: 0,
+        }
+    }
+
+    #[test]
+    fn sphere_start_propagates_resources_error() {
+        let mut backend = DummyBackend;
+        let result = KnystSphere::start(
+            &mut backend,
+            SphereSettings {
+                resources_settings: failing_resources_settings(),
+                ..Default::default()
+            },
+            |_| {},
+        );
+
+        match result {
+            Err(SphereError::ResourcesError(ResourcesError::InvalidWavetableCapacity(
+                usize::MAX,
+            ))) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected start to fail"),
+        }
+    }
+
+    #[test]
+    fn sphere_start_return_controller_propagates_resources_error() {
+        let mut backend = DummyBackend;
+        let result = KnystSphere::start_return_controller(
+            &mut backend,
+            SphereSettings {
+                resources_settings: failing_resources_settings(),
+                ..Default::default()
+            },
+            |_| {},
+        );
+
+        match result {
+            Err(SphereError::ResourcesError(ResourcesError::InvalidWavetableCapacity(
+                usize::MAX,
+            ))) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected start_return_controller to fail"),
         }
     }
 }

@@ -327,7 +327,7 @@ impl Gen for RangeGen {
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let sample_rate = 44100.;
 ///     let block_size = 8;
-///     let resources = Resources::new(ResourcesSettings::default());
+///     let resources = Resources::new(ResourcesSettings::default())?;
 ///     let graph_settings = GraphSettings {
 ///         block_size,
 ///         sample_rate,

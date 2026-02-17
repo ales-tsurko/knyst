@@ -65,6 +65,9 @@ pub enum ResourcesError {
     /// Tried to replace a wavetable, but the WavetableKey supplied doesn't exist.
     #[error("The key for replacement did not exist.")]
     ReplaceWavetableKeyInvalid(Wavetable),
+    /// Resource settings exceed representable capacity.
+    #[error("Invalid wavetable capacity setting: {0}")]
+    InvalidWavetableCapacity(usize),
 }
 
 /// Used for holding either an Id (user facing identifier) or Key (internal
@@ -222,17 +225,20 @@ pub enum ResourcesResponse {
 
 impl Resources {
     /// Create a new `Resources` using `settings`
-    #[must_use]
-    pub fn new(settings: ResourcesSettings) -> Self {
+    pub fn new(settings: ResourcesSettings) -> Result<Self, ResourcesError> {
         const NUM_DEFAULT_WAVETABLES: usize = 1;
         // let user_data = HopSlotMap::with_capacity_and_key(1000);
         let user_data = HashMap::with_capacity(1000);
         let rng = fastrand::Rng::new();
+        let wavetable_capacity = settings
+            .max_wavetables
+            .checked_add(NUM_DEFAULT_WAVETABLES)
+            .ok_or(ResourcesError::InvalidWavetableCapacity(
+                settings.max_wavetables,
+            ))?;
         // Add standard wavetables to the arena
-        let wavetables =
-            SlotMap::with_capacity_and_key(settings.max_wavetables + NUM_DEFAULT_WAVETABLES);
-        let wavetable_ids =
-            SecondaryMap::with_capacity(settings.max_wavetables + NUM_DEFAULT_WAVETABLES);
+        let wavetables = SlotMap::with_capacity_and_key(wavetable_capacity);
+        let wavetable_ids = SecondaryMap::with_capacity(wavetable_capacity);
         let buffers = SlotMap::with_capacity_and_key(settings.max_buffers);
         let buffer_ids = SecondaryMap::with_capacity(settings.max_buffers);
 
@@ -249,10 +255,9 @@ impl Resources {
         };
 
         // Insert default wavetables
-        r.insert_wavetable_with_id(Wavetable::cosine(), WavetableId::cos())
-            .expect("No space in Resources for default wavetables");
+        r.insert_wavetable_with_id(Wavetable::cosine(), WavetableId::cos())?;
 
-        r
+        Ok(r)
     }
     /// Apply the command sent from the user to change the Resources.
     pub(crate) fn apply_command(&mut self, command: ResourcesCommand) -> ResourcesResponse {
@@ -437,5 +442,31 @@ impl Resources {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Resources, ResourcesError, ResourcesSettings};
+
+    #[test]
+    fn resources_new_succeeds_with_default_settings() {
+        let resources = Resources::new(ResourcesSettings::default());
+        assert!(resources.is_ok());
+    }
+
+    #[test]
+    fn resources_new_fails_when_wavetable_capacity_overflows() {
+        let resources = Resources::new(ResourcesSettings {
+            max_wavetables: usize::MAX,
+            max_buffers: 1,
+            max_user_data: 0,
+        });
+
+        match resources {
+            Err(ResourcesError::InvalidWavetableCapacity(usize::MAX)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected constructor to fail"),
+        }
     }
 }

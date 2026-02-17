@@ -77,6 +77,15 @@ pub enum AudioBackendError {
     BackendNotRunning,
     #[error("Unable to create a node from the Graph: {0}")]
     CouldNotCreateNode(String),
+    #[error(
+        "Graph output channel count ({graph_outputs}) does not match backend output channels ({backend_outputs})."
+    )]
+    GraphOutputChannelsMismatch {
+        graph_outputs: usize,
+        backend_outputs: usize,
+    },
+    #[error("No output device was found for CPAL selection: {0}")]
+    OutputDeviceNotFound(String),
     #[error(transparent)]
     RunGraphError(#[from] crate::graph::run_graph::RunGraphError),
     #[cfg(feature = "jack")]
@@ -90,6 +99,9 @@ pub enum AudioBackendError {
     CpalDeviceNameError(#[from] cpal::DeviceNameError),
     #[cfg(feature = "cpal")]
     #[error(transparent)]
+    CpalDefaultStreamConfigError(#[from] cpal::DefaultStreamConfigError),
+    #[cfg(feature = "cpal")]
+    #[error(transparent)]
     CpalStreamError(#[from] cpal::StreamError),
     #[cfg(feature = "cpal")]
     #[error(transparent)]
@@ -97,6 +109,9 @@ pub enum AudioBackendError {
     #[cfg(feature = "cpal")]
     #[error(transparent)]
     CpalPlayStreamError(#[from] cpal::PlayStreamError),
+    #[cfg(feature = "cpal")]
+    #[error("Unsupported CPAL sample format: {0:?}")]
+    UnsupportedSampleFormat(cpal::SampleFormat),
 }
 
 #[cfg(feature = "jack")]
@@ -125,7 +140,7 @@ mod jack_backend {
         pub fn new<S: AsRef<str>>(name: S) -> Result<Self, jack::Error> {
             // Create client
             let (client, _status) =
-                jack::Client::new(name.as_ref(), jack::ClientOptions::NO_START_SERVER).unwrap();
+                jack::Client::new(name.as_ref(), jack::ClientOptions::NO_START_SERVER)?;
             let sample_rate = client.sample_rate();
             let block_size = client.buffer_size() as usize;
             Ok(Self {
@@ -144,7 +159,17 @@ mod jack_backend {
             run_graph_settings: RunGraphSettings,
             error_handler: Box<dyn FnMut(KnystError) + Send + 'static>,
         ) -> Result<Controller, AudioBackendError> {
-            if let Some(JackClient::Passive(client)) = self.client.take() {
+            let client = match self.client.take() {
+                Some(JackClient::Passive(client)) => client,
+                Some(active_client @ JackClient::Active(_)) => {
+                    self.client = Some(active_client);
+                    return Err(AudioBackendError::BackendAlreadyRunning);
+                }
+                None => {
+                    return Err(AudioBackendError::BackendAlreadyRunning);
+                }
+            };
+            {
                 let mut in_ports = vec![];
                 let mut out_ports = vec![];
                 let num_inputs = graph.num_inputs();
@@ -166,9 +191,8 @@ mod jack_backend {
                     out_ports,
                 };
                 // Activate the client, which starts the processing.
-                let active_client = client
-                    .activate_async(JackNotifications::default(), jack_process)
-                    .unwrap();
+                let active_client =
+                    client.activate_async(JackNotifications::default(), jack_process)?;
                 self.client = Some(JackClient::Active(active_client));
                 let controller = Controller::new(
                     graph,
@@ -177,17 +201,21 @@ mod jack_backend {
                     resources_command_receiver,
                 );
                 Ok(controller)
-            } else {
-                Err(AudioBackendError::BackendAlreadyRunning)
             }
         }
 
         fn stop(&mut self) -> Result<(), AudioBackendError> {
-            if let Some(JackClient::Active(active_client)) = self.client.take() {
-                active_client.deactivate().unwrap();
-                Ok(())
-            } else {
-                return Err(AudioBackendError::BackendNotRunning);
+            match self.client.take() {
+                Some(JackClient::Active(active_client)) => {
+                    let (client, _notifications, _process) = active_client.deactivate()?;
+                    self.client = Some(JackClient::Passive(client));
+                    Ok(())
+                }
+                Some(passive_client @ JackClient::Passive(_)) => {
+                    self.client = Some(passive_client);
+                    Err(AudioBackendError::BackendNotRunning)
+                }
+                None => Err(AudioBackendError::BackendNotRunning),
             }
         }
 
@@ -404,6 +432,7 @@ pub mod cpal_backend {
         /// Create a new CpalBackend using the default host, getting a device, but not a stream.
         pub fn new(options: CpalBackendOptions) -> Result<Self, AudioBackendError> {
             let host = cpal::default_host();
+            let selected_device = options.device.clone();
 
             let device = if options.device == "default" {
                 host.default_output_device()
@@ -411,12 +440,12 @@ pub mod cpal_backend {
                 host.output_devices()?
                     .find(|x| x.name().map(|y| y == options.device).unwrap_or(false))
             }
-            .expect("failed to find output device");
+            .ok_or(AudioBackendError::OutputDeviceNotFound(selected_device))?;
             if options.verbose {
                 println!("Output device: {}", device.name()?);
             }
 
-            let config = device.default_output_config().unwrap();
+            let config = device.default_output_config()?;
             if options.verbose {
                 println!("Default output config: {:?}", config);
             }
@@ -444,8 +473,13 @@ pub mod cpal_backend {
             if self.stream.is_some() {
                 return Err(AudioBackendError::BackendAlreadyRunning);
             }
-            if graph.num_outputs() != self.config.channels() as usize {
-                panic!("CpalBackend expects a graph with the same number of outputs as the device. Check CpalBackend::channels().")
+            let backend_outputs = self.config.channels() as usize;
+            let graph_outputs = graph.num_outputs();
+            if graph_outputs != backend_outputs {
+                return Err(AudioBackendError::GraphOutputChannelsMismatch {
+                    graph_outputs,
+                    backend_outputs,
+                });
             }
             if graph.num_inputs() > 0 {
                 eprintln!("Warning: CpalBackend currently does not support inputs into the top level Graph.")
@@ -464,7 +498,7 @@ pub mod cpal_backend {
                 cpal::SampleFormat::U32 => run::<u32>(&self.device, &config.into(), run_graph),
                 cpal::SampleFormat::U64 => run::<u64>(&self.device, &config.into(), run_graph),
                 cpal::SampleFormat::F64 => run::<f64>(&self.device, &config.into(), run_graph),
-                _ => todo!(),
+                other => Err(AudioBackendError::UnsupportedSampleFormat(other)),
             }?;
             self.stream = Some(stream);
             let controller = Controller::new(
@@ -477,7 +511,13 @@ pub mod cpal_backend {
         }
 
         fn stop(&mut self) -> Result<(), AudioBackendError> {
-            todo!()
+            if let Some(stream) = self.stream.take() {
+                // Not all platforms support pause; dropping the stream still stops playback.
+                let _ = stream.pause();
+                Ok(())
+            } else {
+                Err(AudioBackendError::BackendNotRunning)
+            }
         }
 
         fn sample_rate(&self) -> usize {
