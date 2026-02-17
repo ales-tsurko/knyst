@@ -127,6 +127,9 @@ pub enum KnystError {
     /// Error from interacting with an [`AudioBackend`].
     #[error("Audio backend error : {0}")]
     AudioBackendError(#[from] AudioBackendError),
+    /// Error from interacting with the controller command channel.
+    #[error("Controller error : {0}")]
+    ControllerError(#[from] controller::ControllerError),
 }
 
 /// Convert db to amplitude

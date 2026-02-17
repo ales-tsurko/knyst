@@ -59,6 +59,7 @@ enum Command {
     ChangeMusicalTimeMap(Box<dyn FnOnce(&mut MusicalTimeMap) + Send>),
     ScheduleBeatCallback(BeatCallback, StartBeat),
     RequestInspection(std::sync::mpsc::SyncSender<GraphInspection>),
+    ReportError(KnystError),
 }
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,6 +94,7 @@ impl std::fmt::Debug for Command {
             Self::RequestInspection(arg0) => {
                 f.debug_tuple("RequestInspection").field(arg0).finish()
             }
+            Self::ReportError(arg0) => f.debug_tuple("ReportError").field(arg0).finish(),
             Command::SetMortality { node, is_mortal } => f
                 .debug_tuple("SetMortality")
                 .field(node)
@@ -100,6 +102,17 @@ impl std::fmt::Debug for Command {
                 .finish(),
         }
     }
+}
+
+/// Error from sending controller-related commands.
+#[derive(thiserror::Error, Debug)]
+pub enum ControllerError {
+    /// Sending a command to the controller failed because the channel is closed.
+    #[error("Failed to send command to controller because the command channel is closed.")]
+    CommandChannelClosed,
+    /// Sending a graph inspection response failed because the receiver dropped.
+    #[error("Failed to send graph inspection response because the receiver was dropped.")]
+    InspectionResponseChannelClosed,
 }
 
 /// [`KnystCommands`] sends commands to the [`Controller`] which should hold the
@@ -254,6 +267,19 @@ pub struct MultiThreadedKnystCommands {
     changes_bundle_time: Time,
 }
 
+impl MultiThreadedKnystCommands {
+    fn send_command(&self, command: Command) -> Result<(), ControllerError> {
+        self.sender
+            .send(command)
+            .map_err(|_| ControllerError::CommandChannelClosed)
+    }
+
+    /// Best-effort error reporting to the controller error handler.
+    fn report_error(&self, error: impl Into<KnystError>) {
+        let _ = self.send_command(Command::ReportError(error.into()));
+    }
+}
+
 impl KnystCommands for MultiThreadedKnystCommands {
     /// Push a Gen or Graph to the top level Graph without specifying any inputs.
     fn push_without_inputs(&mut self, gen_or_graph: impl GenOrGraph) -> NodeId {
@@ -300,13 +326,10 @@ impl KnystCommands for MultiThreadedKnystCommands {
                     if let Err(e) =
                         g.push_with_existing_address_to_graph(gen_or_graph, &mut node_id, g.id())
                     {
-                        // TODO: report error
-                        // TODO: recover the gen_or_graph from the PushError
-                        eprintln!("{e:?}");
+                        self.report_error(e);
                     }
                     Ok(node_id)
                 } else {
-                    eprintln!("Local graph does not match requested graph");
                     Err(gen_or_graph)
                 }
             } else {
@@ -324,7 +347,9 @@ impl KnystCommands for MultiThreadedKnystCommands {
                     graph_id,
                     start_time: self.changes_bundle_time,
                 };
-                self.sender.send(command).unwrap();
+                if let Err(error) = self.send_command(command) {
+                    self.report_error(error);
+                }
                 new_node_address
             }
         }
@@ -351,8 +376,7 @@ impl KnystCommands for MultiThreadedKnystCommands {
                     Err(e) => match e {
                         ConnectionError::GraphNotFound(_) => false,
                         _ => {
-                            // TODO: Report this error
-                            eprintln!("Error: {e:?}");
+                            self.report_error(e);
                             // We found the correct graph, but there was a different error
                             true
                         }
@@ -363,7 +387,9 @@ impl KnystCommands for MultiThreadedKnystCommands {
             }
         });
         if !found_in_local {
-            self.sender.send(Command::Connect(connection)).unwrap();
+            if let Err(error) = self.send_command(Command::Connect(connection)) {
+                self.report_error(error);
+            }
         }
     }
     /// Make several connections at once using any of the ConnectionBundle
@@ -383,7 +409,9 @@ impl KnystCommands for MultiThreadedKnystCommands {
         let c = BeatCallback::new(callback, Beats::ZERO);
         let handle = c.handle();
         let command = Command::ScheduleBeatCallback(c, start_time);
-        self.sender.send(command).unwrap();
+        if let Err(error) = self.send_command(command) {
+            self.report_error(error);
+        }
         handle
     }
     /// Disconnect (undo) a [`Connection`]
@@ -396,8 +424,7 @@ impl KnystCommands for MultiThreadedKnystCommands {
                     Err(e) => match e {
                         ConnectionError::GraphNotFound(_) => false,
                         _ => {
-                            // TODO: Report this error
-                            eprintln!("Error: {e:?}");
+                            self.report_error(e);
                             // We found the correct graph, but there was a different error
                             true
                         }
@@ -408,24 +435,30 @@ impl KnystCommands for MultiThreadedKnystCommands {
             }
         });
         if !found_in_local {
-            self.sender.send(Command::Disconnect(connection)).unwrap();
+            if let Err(error) = self.send_command(Command::Disconnect(connection)) {
+                self.report_error(error);
+            }
         }
     }
     /// Free any nodes that are not currently connected to the graph's outputs
     /// via any chain of connections.
     fn free_disconnected_nodes(&mut self) {
-        self.sender.send(Command::FreeDisconnectedNodes).unwrap();
+        if let Err(error) = self.send_command(Command::FreeDisconnectedNodes) {
+            self.report_error(error);
+        }
     }
     /// Free a node and try to mend connections between the inputs and the
     /// outputs of the node.
     fn free_node_mend_connections(&mut self, node: NodeId) {
-        self.sender
-            .send(Command::FreeNodeMendConnections(node))
-            .unwrap();
+        if let Err(error) = self.send_command(Command::FreeNodeMendConnections(node)) {
+            self.report_error(error);
+        }
     }
     /// Free a node.
     fn free_node(&mut self, node: NodeId) {
-        self.sender.send(Command::FreeNode(node)).unwrap();
+        if let Err(error) = self.send_command(Command::FreeNode(node)) {
+            self.report_error(error);
+        }
     }
     /// Schedule a change to be made.
     ///
@@ -445,13 +478,13 @@ impl KnystCommands for MultiThreadedKnystCommands {
             LOCAL_GRAPH.with_borrow_mut(|g| {
                 if let Some(g) = g.last_mut() {
                     if let Err(e) = g.schedule_change(change) {
-                        // TODO: report error
-                        // TODO: recover the gen_or_graph from the PushError
-                        eprintln!("{e:?}");
+                        self.report_error(e);
                     }
                 } else {
                     // There is no local graph
-                    self.sender.send(Command::ScheduleChange(change)).unwrap();
+                    if let Err(error) = self.send_command(Command::ScheduleChange(change)) {
+                        self.report_error(error);
+                    }
                 }
             });
         }
@@ -490,18 +523,18 @@ impl KnystCommands for MultiThreadedKnystCommands {
                 LOCAL_GRAPH.with_borrow_mut(|g| {
                     if let Some(g) = g.last_mut() {
                         if let Err(e) = g.schedule_changes(changes, time) {
-                            // TODO: report error
-                            // TODO: recover the gen_or_graph from the PushError
-                            eprintln!("Local graph schedule_changes error: {e:?}");
+                            self.report_error(e);
                         }
                     } else {
                         // There is no local graph
-                        self.sender
-                            .send(Command::ScheduleChanges(SimultaneousChanges {
+                        if let Err(error) =
+                            self.send_command(Command::ScheduleChanges(SimultaneousChanges {
                                 time,
                                 changes,
                             }))
-                            .unwrap();
+                        {
+                            self.report_error(error);
+                        }
                     }
                 });
             }
@@ -511,66 +544,72 @@ impl KnystCommands for MultiThreadedKnystCommands {
     /// converted to a key on the audio thread with access to a [`Resources`].
     fn insert_buffer(&mut self, buffer: Buffer) -> BufferId {
         let id = BufferId::new(&buffer);
-        self.sender
-            .send(Command::ResourcesCommand(ResourcesCommand::InsertBuffer {
+        if let Err(error) =
+            self.send_command(Command::ResourcesCommand(ResourcesCommand::InsertBuffer {
                 id,
                 buffer,
             }))
-            .unwrap();
+        {
+            self.report_error(error);
+        }
         id
     }
     /// Remove a buffer from the [`Resources`]
     fn remove_buffer(&mut self, buffer_id: BufferId) {
-        self.sender
-            .send(Command::ResourcesCommand(ResourcesCommand::RemoveBuffer {
+        if let Err(error) =
+            self.send_command(Command::ResourcesCommand(ResourcesCommand::RemoveBuffer {
                 id: buffer_id,
             }))
-            .unwrap();
+        {
+            self.report_error(error);
+        }
     }
     /// Replace a buffer in the [`Resources`]
     fn replace_buffer(&mut self, buffer_id: BufferId, buffer: Buffer) {
-        self.sender
-            .send(Command::ResourcesCommand(ResourcesCommand::ReplaceBuffer {
+        if let Err(error) =
+            self.send_command(Command::ResourcesCommand(ResourcesCommand::ReplaceBuffer {
                 id: buffer_id,
                 buffer,
             }))
-            .unwrap();
+        {
+            self.report_error(error);
+        }
     }
     /// Inserts a new wavetable in the [`Resources`] and returns an id which can be
     /// converted to a key on the audio thread with access to a [`Resources`].
     fn insert_wavetable(&mut self, wavetable: Wavetable) -> WavetableId {
         let id = WavetableId::new();
-        self.sender
-            .send(Command::ResourcesCommand(
-                ResourcesCommand::InsertWavetable { id, wavetable },
-            ))
-            .unwrap();
+        if let Err(error) = self.send_command(Command::ResourcesCommand(
+            ResourcesCommand::InsertWavetable { id, wavetable },
+        )) {
+            self.report_error(error);
+        }
         id
     }
     /// Remove a wavetable from the [`Resources`]
     fn remove_wavetable(&mut self, wavetable_id: WavetableId) {
-        self.sender
-            .send(Command::ResourcesCommand(
-                ResourcesCommand::RemoveWavetable { id: wavetable_id },
-            ))
-            .unwrap();
+        if let Err(error) = self.send_command(Command::ResourcesCommand(
+            ResourcesCommand::RemoveWavetable { id: wavetable_id },
+        )) {
+            self.report_error(error);
+        }
     }
     /// Replace a wavetable in the [`Resources`]
     fn replace_wavetable(&mut self, id: WavetableId, wavetable: Wavetable) {
-        self.sender
-            .send(Command::ResourcesCommand(
-                ResourcesCommand::ReplaceWavetable { id, wavetable },
-            ))
-            .unwrap();
+        if let Err(error) = self.send_command(Command::ResourcesCommand(
+            ResourcesCommand::ReplaceWavetable { id, wavetable },
+        )) {
+            self.report_error(error);
+        }
     }
     /// Make a change to the shared [`MusicalTimeMap`]
     fn change_musical_time_map(
         &mut self,
         change_fn: impl FnOnce(&mut MusicalTimeMap) + Send + 'static,
     ) {
-        self.sender
-            .send(Command::ChangeMusicalTimeMap(Box::new(change_fn)))
-            .unwrap();
+        if let Err(error) = self.send_command(Command::ChangeMusicalTimeMap(Box::new(change_fn))) {
+            self.report_error(error);
+        }
     }
     /// Return the [`GraphSettings`] of the top level graph. This means you
     /// don't have to manually keep track of matching sample rate and block size
@@ -607,9 +646,9 @@ impl KnystCommands for MultiThreadedKnystCommands {
 
     fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        self.sender
-            .send(Command::RequestInspection(sender))
-            .unwrap();
+        if let Err(error) = self.send_command(Command::RequestInspection(sender)) {
+            self.report_error(error);
+        }
         receiver
     }
 
@@ -661,8 +700,7 @@ impl KnystCommands for MultiThreadedKnystCommands {
                     Err(e) => match e {
                         ScheduleError::GraphNotFound(_) => false,
                         _ => {
-                            // TODO: Report this error
-                            eprintln!("Error: {e:?}");
+                            self.report_error(e);
                             // We found the correct graph, but there was a different error
                             true
                         }
@@ -673,9 +711,9 @@ impl KnystCommands for MultiThreadedKnystCommands {
             }
         });
         if !found_in_local {
-            self.sender
-                .send(Command::SetMortality { node, is_mortal })
-                .unwrap();
+            if let Err(error) = self.send_command(Command::SetMortality { node, is_mortal }) {
+                self.report_error(error);
+            }
         }
     }
     // /// Create a new Self which pushes to the selected GraphId by default
@@ -928,8 +966,7 @@ impl Controller {
                     Ok(_) => Ok(()),
                     Err(e) => match e {
                         crate::graph::ScheduleError::GraphNotFound(_node) => {
-                            // println!("Didn't find graph for:");
-                            println!("Failed to schedule {changes_clone:?}");
+                            let _ = changes_clone;
                             Err(e.into())
                         }
                         _ => Err(e.into()),
@@ -956,13 +993,10 @@ impl Controller {
                 self.beat_callbacks.push(callback);
                 Ok(())
             }
-            Command::RequestInspection(sender) => {
-                // TODO: Proper error handling
-                sender
-                    .send(self.top_level_graph.generate_inspection())
-                    .unwrap();
-                Ok(())
-            }
+            Command::RequestInspection(sender) => sender
+                .send(self.top_level_graph.generate_inspection())
+                .map_err(|_| ControllerError::InspectionResponseChannelClosed.into()),
+            Command::ReportError(error) => Err(error),
             Command::SetMortality { node, is_mortal } => self
                 .top_level_graph
                 .set_node_mortality(node, is_mortal)
@@ -1114,9 +1148,34 @@ pub fn print_error_handler(e: KnystError) {
 
 #[cfg(test)]
 mod tests {
-    use super::schedule_bundle;
+    use super::{schedule_bundle, Command, Controller, ControllerError};
     use crate as knyst;
-    use crate::{knyst_commands, offline::KnystOffline, prelude::*, trig::once_trig};
+    use crate::{
+        graph::{Graph, GraphSettings, NodeId},
+        knyst_commands,
+        offline::KnystOffline,
+        prelude::*,
+        trig::once_trig,
+        KnystError,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn new_test_controller(errors: Arc<Mutex<Vec<KnystError>>>) -> Controller {
+        let graph = Graph::new(GraphSettings::default());
+        let (resources_sender, _resources_receiver) = rtrb::RingBuffer::new(8);
+        let (_resources_response_sender, resources_receiver) = rtrb::RingBuffer::new(8);
+        Controller::new(
+            graph,
+            move |error| {
+                errors
+                    .lock()
+                    .expect("test error sink lock should not be poisoned")
+                    .push(error);
+            },
+            resources_sender,
+            resources_receiver,
+        )
+    }
 
     // Outputs its input value + 1
     struct OneGen {}
@@ -1275,5 +1334,60 @@ mod tests {
         assert_eq!(o[17], 3.0);
         assert_eq!(o[19], 4.0);
         assert_eq!(o[20], 5.0);
+    }
+
+    #[test]
+    fn request_inspection_reports_dropped_receiver() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+
+        controller.apply_command(Command::RequestInspection(sender));
+
+        let errors = errors
+            .lock()
+            .expect("test error sink lock should not be poisoned");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            KnystError::ControllerError(ControllerError::InspectionResponseChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn report_error_command_forwards_to_error_handler() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let expected_error = KnystError::ControllerError(ControllerError::CommandChannelClosed);
+
+        controller.apply_command(Command::ReportError(expected_error));
+
+        let errors = errors
+            .lock()
+            .expect("test error sink lock should not be poisoned");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            KnystError::ControllerError(ControllerError::CommandChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn command_api_does_not_panic_when_controller_is_dropped() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let controller = new_test_controller(errors);
+        let mut commands = controller.get_knyst_commands();
+        let graph_id = commands.current_graph();
+        drop(controller);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commands.free_disconnected_nodes();
+            commands.free_node(NodeId::new(graph_id));
+            commands.change_musical_time_map(|_| {});
+            let _ = commands.request_inspection();
+        }));
+
+        assert!(result.is_ok());
     }
 }
