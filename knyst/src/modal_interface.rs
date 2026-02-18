@@ -17,13 +17,13 @@ use crate::controller::{
 use crate::graph::connection::{ConnectionBundle, InputBundle};
 use crate::graph::{
     Connection, GenOrGraph, GraphId, GraphSettings, NodeId, ParameterChange, SimultaneousChanges,
-    Time,
+    Time, TransportSnapshot,
 };
 use crate::handles::{GraphHandle, Handle};
 use crate::inspection::GraphInspection;
 use crate::resources::{BufferId, ResourcesError, WavetableId};
 use crate::scheduling::MusicalTimeMap;
-use crate::time::Beats;
+use crate::time::{Beats, Seconds};
 use crate::wavetable_aa::Wavetable;
 
 /// Shared command handle that preserves mutable command state across clones.
@@ -156,6 +156,28 @@ impl KnystCommands for SharedKnystCommands {
 
     fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection> {
         self.lock().request_inspection()
+    }
+
+    fn transport_play(&mut self) {
+        self.lock().transport_play();
+    }
+
+    fn transport_pause(&mut self) {
+        self.lock().transport_pause();
+    }
+
+    fn transport_seek_to_seconds(&mut self, position: Seconds) {
+        self.lock().transport_seek_to_seconds(position);
+    }
+
+    fn transport_seek_to_beats(&mut self, position: Beats) {
+        self.lock().transport_seek_to_beats(position);
+    }
+
+    fn request_transport_snapshot(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>> {
+        self.lock().request_transport_snapshot()
     }
 
     fn default_graph_settings(&self) -> GraphSettings {

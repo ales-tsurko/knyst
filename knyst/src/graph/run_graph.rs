@@ -5,7 +5,7 @@
 
 use std::{
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[allow(unused)]
@@ -84,13 +84,7 @@ impl RunGraph {
                 // raw pointer.
                 let output_node_buffer_ref = graph_node.output_buffers();
 
-                let scheduler_start_time_stamp = Instant::now();
-                graph.start_scheduler(
-                    settings.scheduling_latency,
-                    scheduler_start_time_stamp,
-                    &None,
-                    &musical_time_map,
-                );
+                graph.start_scheduler(settings.scheduling_latency, &None, &musical_time_map);
                 // Run a first update to make sure any queued changes get sent to the GraphGen
                 graph.update();
                 // Create ring buffer channels for communicating with Resources

@@ -55,7 +55,7 @@ use std::mem;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use self::connection::{ConnectionBundle, NodeChannel, NodeInput, NodeOutput};
 
@@ -380,6 +380,28 @@ pub enum Time {
     Immediately,
 }
 
+/// Playback state of the transport timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportState {
+    /// Transport timeline advances with audio time.
+    Playing,
+    /// Transport timeline is paused at a fixed position.
+    Paused,
+}
+
+/// Snapshot of the transport timeline position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    /// Current transport state.
+    pub state: TransportState,
+    /// Position in samples from transport start.
+    pub samples: u64,
+    /// Position in seconds from transport start.
+    pub seconds: Seconds,
+    /// Position in beats, if the tempo map can be read.
+    pub beats: Option<Beats>,
+}
+
 /// Newtype for using a [`Time`] as an offset.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
@@ -652,6 +674,8 @@ pub enum ScheduleError {
     SchedulerNotCreated,
     #[error("A lock for writing to the MusicalTimeMap cannot be acquired.")]
     MusicalTimeMapCannotBeWrittenTo,
+    #[error("A lock for reading from the MusicalTimeMap cannot be acquired.")]
+    MusicalTimeMapCannotBeReadFrom,
     #[error("Tried to schedule change `{change:?}` to non existing input `{channel:?}` for node `{node_name}`")]
     InputOutOfRange {
         node_name: String,
@@ -1412,7 +1436,7 @@ impl Graph {
 
             let mut scheduler_ts = false;
             if let Some(ggc) = &mut self.graph_gen_communicator {
-                if let Some(ts) = ggc.scheduler.time_to_frames_timestamp(start_time) {
+                if let Ok(Some(ts)) = ggc.scheduler.time_to_engine_timestamp(start_time) {
                     start_timestamp = ts;
                     scheduler_ts = true;
                 }
@@ -1441,7 +1465,6 @@ impl Graph {
                 // graph is started, otherwise it will never start.
                 if let Some(ggc) = &mut self.graph_gen_communicator {
                     if let Scheduler::Running {
-                        start_ts,
                         latency_in_samples,
                         musical_time_map,
                         ..
@@ -1452,14 +1475,9 @@ impl Graph {
                             clock_sample_rate: self.sample_rate,
                         };
                         let latency = Duration::from_secs_f64(
-                            *latency_in_samples / (self.sample_rate as f64),
+                            (*latency_in_samples as f64) / (self.sample_rate as f64),
                         );
-                        graph.start_scheduler(
-                            latency,
-                            *start_ts,
-                            &Some(clock_update),
-                            musical_time_map,
-                        );
+                        graph.start_scheduler(latency, &Some(clock_update), musical_time_map);
                     }
                 }
                 self.graphs_per_node.insert(node_key, graph);
@@ -1911,7 +1929,6 @@ impl Graph {
     fn start_scheduler(
         &mut self,
         latency: Duration,
-        start_ts: Instant,
         clock_update: &Option<ClockUpdate>,
         musical_time_map: &Arc<RwLock<MusicalTimeMap>>,
     ) {
@@ -1923,26 +1940,20 @@ impl Graph {
                 self.sample_rate * (self.oversampling.as_usize() as Sample),
                 self.block_size * self.oversampling.as_usize(),
                 latency,
-                start_ts,
+                ggc.timestamp.clone(),
                 musical_time_map.clone(),
             );
         }
         for (_key, graph) in &mut self.graphs_per_node {
-            graph.start_scheduler(latency, start_ts, clock_update, musical_time_map);
+            graph.start_scheduler(latency, clock_update, musical_time_map);
         }
     }
     /// Returns the current audio thread time in Beats based on the
     /// MusicalTimeMap, or None if it is not available (e.g. if the Graph has
     /// not been started yet).
     pub fn get_current_time_musical(&self) -> Option<Beats> {
-        if let Some(ggc) = &self.graph_gen_communicator {
-            let ts_samples = ggc.timestamp.load(Ordering::Relaxed);
-            let seconds = (ts_samples as f64) / (self.sample_rate as f64);
-            ggc.scheduler
-                .seconds_to_musical_time_beats(Seconds::from_seconds_f64(seconds))
-        } else {
-            None
-        }
+        self.transport_snapshot()
+            .and_then(|snapshot| snapshot.beats)
     }
     /// Generate inspection metadata for this graph and all sub graphs. Can be
     /// used to generate static or dynamic inspection and manipulation tools.
@@ -2144,7 +2155,7 @@ impl Graph {
             }
         }
         if let Some(ggc) = &mut self.graph_gen_communicator {
-            ggc.scheduler.schedule(scheduler_changes, time);
+            ggc.scheduler.schedule(scheduler_changes, time)?;
         } else {
             self.scheduled_changes_queue.push((scheduler_changes, time));
         }
@@ -2187,7 +2198,7 @@ impl Graph {
                 };
                 if let Some(ggc) = &mut self.graph_gen_communicator {
                     ggc.scheduler
-                        .schedule(vec![(key, change_kind, None)], change.time);
+                        .schedule(vec![(key, change_kind, None)], change.time)?;
                 } else {
                     self.scheduled_changes_queue
                         .push((vec![(key, change_kind, None)], change.time));
@@ -2417,7 +2428,7 @@ impl Graph {
                         0
                     };
                     if let Some(ggc) = &mut self.graph_gen_communicator {
-                        ggc.scheduler.schedule(
+                        let _ = ggc.scheduler.schedule(
                             vec![(
                                 sink_key,
                                 ScheduledChangeKind::Constant {
@@ -2806,7 +2817,7 @@ impl Graph {
                         0
                     };
                     if let Some(ggc) = &mut self.graph_gen_communicator {
-                        ggc.scheduler.schedule(
+                        let _ = ggc.scheduler.schedule(
                             vec![(
                                 sink_key,
                                 ScheduledChangeKind::Constant {
@@ -3170,6 +3181,50 @@ impl Graph {
             Err(ScheduleError::SchedulerNotCreated)
         }
     }
+
+    /// Start transport playback.
+    pub fn transport_play(&mut self) -> Result<(), ScheduleError> {
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.scheduler.play()
+        } else {
+            Err(ScheduleError::SchedulerNotCreated)
+        }
+    }
+
+    /// Pause transport playback.
+    pub fn transport_pause(&mut self) -> Result<(), ScheduleError> {
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.scheduler.pause()
+        } else {
+            Err(ScheduleError::SchedulerNotCreated)
+        }
+    }
+
+    /// Seek transport to an absolute seconds position.
+    pub fn transport_seek_to_seconds(&mut self, position: Seconds) -> Result<(), ScheduleError> {
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.scheduler.seek_seconds(position)
+        } else {
+            Err(ScheduleError::SchedulerNotCreated)
+        }
+    }
+
+    /// Seek transport to an absolute beats position.
+    pub fn transport_seek_to_beats(&mut self, position: Beats) -> Result<(), ScheduleError> {
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.scheduler.seek_beats(position)
+        } else {
+            Err(ScheduleError::SchedulerNotCreated)
+        }
+    }
+
+    /// Query current transport state and position.
+    #[must_use]
+    pub fn transport_snapshot(&self) -> Option<TransportSnapshot> {
+        self.graph_gen_communicator
+            .as_ref()
+            .and_then(|ggc| ggc.scheduler.transport_snapshot())
+    }
     /// Goes through all of the nodes that are connected to nodes in `nodes_to_process` and adds them to the list in
     /// reverse depth first order.
     ///
@@ -3466,7 +3521,7 @@ impl Graph {
             RingBuffer::<TaskData>::new(self.ring_buffer_size);
         let mut scheduler = Scheduler::new();
         for (schedule_changes, time) in self.scheduled_changes_queue.drain(..) {
-            scheduler.schedule(schedule_changes, time);
+            let _ = scheduler.schedule(schedule_changes, time);
         }
 
         let scheduler_buffer_size = self.ring_buffer_size;
@@ -3692,42 +3747,19 @@ enum ScheduledChangeKind {
     Constant { index: usize, value: Sample },
     Trigger { index: usize },
 }
-// #[derive(Eq, Copy, Clone)]
-// enum AudioThreadTimestamp {
-//     Samples(u64),
-//     ASAP,
-// }
-// impl AudioThreadTimestamp {
-//     fn to_samples_from_now(&self, sample_counter: u64) -> u64 {
-//         match self {
-//             AudioThreadTimestamp::Samples(ts) => ts - sample_counter,
-//             AudioThreadTimestamp::ASAP => 0,
-//         }
-//     }
-// }
-// impl PartialEq for AudioThreadTimestamp {
-//     fn eq(&self, other: &Self) -> bool {
-//         match (self, other) {
-//             (Self::Samples(l0), Self::Samples(r0)) => l0 == r0,
-//             _ => core::mem::discriminant(self) == core::mem::discriminant(other),
-//         }
-//     }
-// }
-// impl PartialOrd for AudioThreadTimestamp {
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         Some(match (self, other) {
-//             (Self::ASAP, Self::ASAP) => std::cmp::Ordering::Equal,
-//             (Self::ASAP, Self::Samples(_)) => std::cmp::Ordering::Less,
-//             (Self::Samples(_), Self::ASAP) => std::cmp::Ordering::More,
-//             (Self::Samples(s0), Self::Samples(s1)) => s0.partial_cmp(s1).unwrap(),
-//         })
-//     }
-// }
-// impl Ord for AudioThreadTimestamp {
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         self.partial_cmp(other).unwrap()
-//     }
-// }
+
+/// Scheduled change in transport time domain.
+#[derive(Clone, Copy, Debug)]
+struct PendingScheduledChange {
+    /// Timestamp in transport samples.
+    transport_timestamp: u64,
+    key: NodeKey,
+    kind: ScheduledChangeKind,
+    /// If a change is unable to be applied on the audio thread for many
+    /// blocks it has to be removed to make space. This counter counts the blocks
+    /// since the change first expired.
+    removal_countdown: u8,
+}
 
 type SchedulingQueueItem = (
     Vec<(NodeKey, ScheduledChangeKind, Option<TimeOffset>)>,
@@ -3746,20 +3778,63 @@ enum Scheduler {
         scheduling_queue: Vec<SchedulingQueueItem>,
     },
     Running {
-        /// The starting time of the audio thread graph, relative to which time also
-        /// passes for the audio thread. This is the timestamp that is used to
-        /// convert wall clock time to number of samples since the audio thread
-        /// started.
-        start_ts: Instant,
         /// Sample rate including oversampling
         sample_rate: u64,
         /// if the ts of the change is less than this number of samples in the future, send it to the GraphGen
         max_duration_to_send: u64,
         /// Changes waiting to be sent to the GraphGen because they are too far into the future
-        scheduling_queue: Vec<ScheduledChange>,
-        latency_in_samples: f64,
+        scheduling_queue: Vec<PendingScheduledChange>,
+        latency_in_samples: u64,
         musical_time_map: Arc<RwLock<MusicalTimeMap>>,
+        engine_timestamp: Arc<AtomicU64>,
+        transport: TransportClock,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransportClock {
+    state: TransportState,
+    anchor_engine_samples: u64,
+    anchor_transport_samples: u64,
+}
+
+impl TransportClock {
+    fn new(anchor_engine_samples: u64) -> Self {
+        Self {
+            state: TransportState::Playing,
+            anchor_engine_samples,
+            anchor_transport_samples: 0,
+        }
+    }
+
+    fn position_samples(self, engine_samples: u64) -> u64 {
+        match self.state {
+            TransportState::Playing => self
+                .anchor_transport_samples
+                .saturating_add(engine_samples.saturating_sub(self.anchor_engine_samples)),
+            TransportState::Paused => self.anchor_transport_samples,
+        }
+    }
+
+    fn play(&mut self, engine_samples: u64) {
+        if self.state == TransportState::Paused {
+            self.anchor_engine_samples = engine_samples;
+            self.state = TransportState::Playing;
+        }
+    }
+
+    fn pause(&mut self, engine_samples: u64) {
+        if self.state == TransportState::Playing {
+            self.anchor_transport_samples = self.position_samples(engine_samples);
+            self.anchor_engine_samples = engine_samples;
+            self.state = TransportState::Paused;
+        }
+    }
+
+    fn seek(&mut self, engine_samples: u64, transport_samples: u64) {
+        self.anchor_engine_samples = engine_samples;
+        self.anchor_transport_samples = transport_samples;
+    }
 }
 
 impl Scheduler {
@@ -3773,7 +3848,7 @@ impl Scheduler {
         sample_rate: Sample,
         block_size: usize,
         latency: Duration,
-        audio_thread_start_ts: Instant,
+        engine_timestamp: Arc<AtomicU64>,
         musical_time_map: Arc<RwLock<MusicalTimeMap>>,
     ) {
         match self {
@@ -3787,65 +3862,206 @@ impl Scheduler {
                 // this is compared to is loaded atomically from the GraphGen
                 // and there might be a race condition if less than 2 blocks of
                 // events are sent.
-                let max_duration_to_send =
-                    ((sample_rate * 0.5) as u64).max((block_size as u64) * 2);
+                let max_duration_to_send = (block_size as u64) * 2;
+                let transport = TransportClock::new(engine_timestamp.load(Ordering::SeqCst));
                 let mut new_scheduler = Scheduler::Running {
-                    start_ts: audio_thread_start_ts,
                     #[allow(clippy::cast_possible_truncation)]
                     sample_rate: sample_rate as u64,
                     max_duration_to_send,
                     scheduling_queue: vec![],
-                    latency_in_samples: latency.as_secs_f64() * (sample_rate as f64),
+                    latency_in_samples: (latency.as_secs_f64() * (sample_rate as f64)) as u64,
                     musical_time_map,
+                    engine_timestamp,
+                    transport,
                 };
                 for (changes, time) in scheduling_queue {
-                    new_scheduler.schedule(changes, time);
+                    let _ = new_scheduler.schedule(changes, time);
                 }
                 *self = new_scheduler;
             }
             Scheduler::Running { .. } => (),
         }
     }
-    /// Converts a [`Time`] to a number of frames from the start time of the graph
-    fn time_to_frames_timestamp(&mut self, time: Time) -> Option<u64> {
+
+    fn current_transport_samples(&self) -> Option<u64> {
         match self {
             Scheduler::Stopped { .. } => None,
             Scheduler::Running {
-                start_ts,
+                engine_timestamp,
+                transport,
+                ..
+            } => Some(transport.position_samples(engine_timestamp.load(Ordering::SeqCst))),
+        }
+    }
+
+    /// Converts a [`Time`] to a transport timestamp in samples.
+    fn time_to_transport_timestamp(&self, time: Time) -> Result<Option<u64>, ScheduleError> {
+        match self {
+            Scheduler::Stopped { .. } => Ok(None),
+            Scheduler::Running {
                 sample_rate,
                 latency_in_samples: latency,
                 musical_time_map,
                 ..
             } => {
-                Some(match time {
-                    Time::DurationFromNow(duration_from_now) => {
-                        ((start_ts.elapsed() + duration_from_now).as_secs_f64()
-                            * (*sample_rate as f64)
-                            + *latency) as u64
-                    }
+                let current_transport = self.current_transport_samples().unwrap_or(0);
+                let ts = match time {
+                    Time::DurationFromNow(duration_from_now) => current_transport
+                        .saturating_add(
+                            (duration_from_now.as_secs_f64() * (*sample_rate as f64)) as u64,
+                        )
+                        .saturating_add(*latency),
                     Time::Seconds(seconds) => seconds.to_samples(*sample_rate),
                     Time::Beats(mt) => {
-                        // TODO: Remove unwrap, return a Result
-                        let mtm = musical_time_map.read().unwrap();
-                        let duration_from_start =
-                            Duration::from_secs_f64(mtm.musical_time_to_secs_f64(mt));
-
-                        (duration_from_start.as_secs_f64() * (*sample_rate as f64) + *latency)
-                            as u64
+                        let mtm = musical_time_map
+                            .read()
+                            .map_err(|_| ScheduleError::MusicalTimeMapCannotBeReadFrom)?;
+                        let seconds = mtm.musical_time_to_secs_f64(mt);
+                        (seconds * (*sample_rate as f64)) as u64
                     }
-                    Time::Immediately => 0,
+                    Time::Immediately => current_transport,
+                };
+                Ok(Some(ts))
+            }
+        }
+    }
+
+    /// Converts a [`Time`] to an engine timestamp in samples, if representable.
+    ///
+    /// This returns `None` when transport is paused and the requested time lies
+    /// in the future relative to current transport position.
+    fn time_to_engine_timestamp(&self, time: Time) -> Result<Option<u64>, ScheduleError> {
+        match self {
+            Scheduler::Stopped { .. } => Ok(None),
+            Scheduler::Running {
+                engine_timestamp,
+                transport,
+                ..
+            } => {
+                let engine_now = engine_timestamp.load(Ordering::SeqCst);
+                let current_transport = transport.position_samples(engine_now);
+                let target_transport = self.time_to_transport_timestamp(time)?.unwrap_or(0);
+                if current_transport >= target_transport {
+                    Ok(Some(engine_now))
+                } else if transport.state == TransportState::Playing {
+                    Ok(Some(
+                        engine_now.saturating_add(target_transport - current_transport),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    fn apply_seek(&mut self, transport_samples: u64) -> Result<(), ScheduleError> {
+        match self {
+            Scheduler::Stopped { .. } => Err(ScheduleError::SchedulerNotCreated),
+            Scheduler::Running {
+                engine_timestamp,
+                transport,
+                scheduling_queue,
+                ..
+            } => {
+                let engine_now = engine_timestamp.load(Ordering::SeqCst);
+                transport.seek(engine_now, transport_samples);
+                scheduling_queue.retain(|change| change.transport_timestamp >= transport_samples);
+                Ok(())
+            }
+        }
+    }
+
+    fn play(&mut self) -> Result<(), ScheduleError> {
+        match self {
+            Scheduler::Stopped { .. } => Err(ScheduleError::SchedulerNotCreated),
+            Scheduler::Running {
+                engine_timestamp,
+                transport,
+                ..
+            } => {
+                transport.play(engine_timestamp.load(Ordering::SeqCst));
+                Ok(())
+            }
+        }
+    }
+
+    fn pause(&mut self) -> Result<(), ScheduleError> {
+        match self {
+            Scheduler::Stopped { .. } => Err(ScheduleError::SchedulerNotCreated),
+            Scheduler::Running {
+                engine_timestamp,
+                transport,
+                ..
+            } => {
+                transport.pause(engine_timestamp.load(Ordering::SeqCst));
+                Ok(())
+            }
+        }
+    }
+
+    fn seek_seconds(&mut self, position: Seconds) -> Result<(), ScheduleError> {
+        match self {
+            Scheduler::Stopped { .. } => Err(ScheduleError::SchedulerNotCreated),
+            Scheduler::Running { sample_rate, .. } => {
+                let samples = position.to_samples(*sample_rate);
+                self.apply_seek(samples)
+            }
+        }
+    }
+
+    fn seek_beats(&mut self, position: Beats) -> Result<(), ScheduleError> {
+        let seconds = match self {
+            Scheduler::Stopped { .. } => return Err(ScheduleError::SchedulerNotCreated),
+            Scheduler::Running {
+                musical_time_map, ..
+            } => {
+                let mtm = musical_time_map
+                    .read()
+                    .map_err(|_| ScheduleError::MusicalTimeMapCannotBeReadFrom)?;
+                Seconds::from_seconds_f64(mtm.musical_time_to_secs_f64(position))
+            }
+        };
+        self.seek_seconds(seconds)
+    }
+
+    fn transport_snapshot(&self) -> Option<TransportSnapshot> {
+        match self {
+            Scheduler::Stopped { .. } => None,
+            Scheduler::Running {
+                sample_rate,
+                transport,
+                engine_timestamp,
+                musical_time_map,
+                ..
+            } => {
+                let engine_now = engine_timestamp.load(Ordering::SeqCst);
+                let samples = transport.position_samples(engine_now);
+                let seconds = Seconds::from_samples(samples, *sample_rate);
+                let beats = musical_time_map
+                    .read()
+                    .ok()
+                    .map(|map| map.seconds_to_beats(seconds));
+                Some(TransportSnapshot {
+                    state: transport.state,
+                    samples,
+                    seconds,
+                    beats,
                 })
             }
         }
     }
+
     fn schedule(
         &mut self,
         changes: Vec<(NodeKey, ScheduledChangeKind, Option<TimeOffset>)>,
         time: Time,
-    ) {
-        let timestamp = self.time_to_frames_timestamp(time);
+    ) -> Result<(), ScheduleError> {
+        let timestamp = self.time_to_transport_timestamp(time)?;
         match self {
-            Scheduler::Stopped { scheduling_queue } => scheduling_queue.push((changes, time)),
+            Scheduler::Stopped { scheduling_queue } => {
+                scheduling_queue.push((changes, time));
+                Ok(())
+            }
             Scheduler::Running {
                 sample_rate,
                 max_duration_to_send: _,
@@ -3853,7 +4069,7 @@ impl Scheduler {
                 ..
             } => {
                 // timestamp will be Some if the Scheduler is running
-                let timestamp = timestamp.unwrap();
+                let timestamp = timestamp.unwrap_or(0);
                 let offset_to_frames = |time_offset: Option<TimeOffset>| {
                     if let Some(to) = time_offset {
                         to.to_frames(*sample_rate)
@@ -3865,31 +4081,18 @@ impl Scheduler {
                     let frame_offset = offset_to_frames(time_offset);
                     let mut ts = timestamp;
                     if frame_offset >= 0 {
-                        ts = ts
-                                    .checked_add(frame_offset as u64)
-                                    .unwrap_or_else(|| {
-                                        eprintln!(
-                                            "Used a time offset that made the timestamp overflow: {frame_offset:?}"
-                                        );
-                                        timestamp
-                                    });
+                        ts = ts.saturating_add(frame_offset as u64);
                     } else {
-                        ts = ts
-                                    .checked_sub(-frame_offset as u64)
-                                    .unwrap_or_else(|| {
-                                        eprintln!(
-                                            "Used a time offset that made the timestamp overflow: {frame_offset:?}"
-                                        );
-                                        timestamp
-                                    });
+                        ts = ts.saturating_sub((-frame_offset) as u64);
                     }
-                    scheduling_queue.push(ScheduledChange {
-                        timestamp: ts,
+                    scheduling_queue.push(PendingScheduledChange {
+                        transport_timestamp: ts,
                         key,
                         kind: change_kind,
                         removal_countdown: 0,
                     });
                 }
+                Ok(())
             }
         }
     }
@@ -3912,10 +4115,10 @@ impl Scheduler {
     }
     /// Schedules a change to be applied at the time of calling the function + the latency setting.
     fn schedule_now(&mut self, key: NodeKey, change: ScheduledChangeKind) {
-        self.schedule(
+        let _ = self.schedule(
             vec![(key, change, None)],
             Time::DurationFromNow(Duration::new(0, 0)),
-        )
+        );
     }
     fn update(&mut self, timestamp: u64, rb_producer: &mut rtrb::Producer<ScheduledChange>) {
         match self {
@@ -3923,35 +4126,43 @@ impl Scheduler {
             Scheduler::Running {
                 max_duration_to_send,
                 scheduling_queue,
+                transport,
                 ..
             } => {
+                if transport.state == TransportState::Paused {
+                    return;
+                }
+                let current_transport = transport.position_samples(timestamp);
                 // scheduled updates should always be sorted before they are sent, in case there are several changes to the same thing
-                scheduling_queue.sort_unstable_by_key(|s| s.timestamp);
+                scheduling_queue.sort_unstable_by_key(|s| s.transport_timestamp);
 
                 let mut i = 0;
                 while i < scheduling_queue.len() {
-                    if timestamp > scheduling_queue[i].timestamp
-                        || scheduling_queue[i].timestamp - timestamp < *max_duration_to_send
+                    let pending = scheduling_queue[i];
+                    if current_transport >= pending.transport_timestamp
+                        || pending.transport_timestamp - current_transport < *max_duration_to_send
                     {
-                        let change = scheduling_queue.remove(i);
-                        if let Err(e) = rb_producer.push(change) {
-                            eprintln!("Unable to push scheduled change into RingBuffer: {e}");
+                        let target_engine_timestamp =
+                            if current_transport >= pending.transport_timestamp {
+                                timestamp
+                            } else {
+                                timestamp + (pending.transport_timestamp - current_transport)
+                            };
+                        let push_result = rb_producer.push(ScheduledChange {
+                            timestamp: target_engine_timestamp,
+                            key: pending.key,
+                            kind: pending.kind,
+                            removal_countdown: pending.removal_countdown,
+                        });
+                        if push_result.is_ok() {
+                            scheduling_queue.remove(i);
+                        } else {
+                            break;
                         }
                     } else {
                         i += 1;
                     }
                 }
-            }
-        }
-    }
-    fn seconds_to_musical_time_beats(&self, ts: Seconds) -> Option<Beats> {
-        match self {
-            Scheduler::Stopped { .. } => None,
-            Scheduler::Running {
-                musical_time_map, ..
-            } => {
-                let mtm = musical_time_map.read().unwrap();
-                Some(mtm.seconds_to_beats(ts))
             }
         }
     }

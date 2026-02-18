@@ -12,6 +12,7 @@ use crate::controller::KnystCommands;
 use crate::gen::{BufferReader, WavetableOscillatorOwned};
 use crate::graph::{FreeError, Oversampling, ScheduleError};
 use crate::prelude::*;
+use crate::scheduling::TempoChange;
 use crate::time::{Beats, Seconds};
 use crate::{controller::Controller, graph::connection::constant};
 
@@ -29,6 +30,18 @@ impl OneGen {
 }
 struct DummyGen {
     counter: Sample,
+}
+
+struct ValueGen;
+#[impl_gen]
+impl ValueGen {
+    #[process]
+    fn process(&mut self, value: &[Sample], output: &mut [Sample]) -> GenState {
+        for (v, out) in value.iter().zip(output.iter_mut()) {
+            *out = *v;
+        }
+        GenState::Continue
+    }
 }
 #[impl_gen]
 impl DummyGen {
@@ -1198,4 +1211,294 @@ fn stereo_timing_mult_inner_graph() {
     for (&l, &r) in out_left.iter().zip(out_right) {
         assert!(l == r - 200.);
     }
+}
+
+#[test]
+fn transport_pause_play_and_seek_seconds() {
+    let sample_rate = 100;
+    let block_size = 10;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+        },
+    );
+
+    run_graph.process_block();
+    let before_pause = graph
+        .transport_snapshot()
+        .expect("transport should be available after graph start");
+    assert_eq!(before_pause.state, TransportState::Playing);
+
+    graph
+        .transport_pause()
+        .expect("transport pause should succeed");
+    run_graph.process_block();
+    run_graph.process_block();
+
+    let paused = graph
+        .transport_snapshot()
+        .expect("transport snapshot should be available");
+    assert_eq!(paused.state, TransportState::Paused);
+    assert_eq!(paused.samples, before_pause.samples);
+
+    graph
+        .transport_play()
+        .expect("transport play should succeed");
+    run_graph.process_block();
+    let resumed = graph
+        .transport_snapshot()
+        .expect("transport snapshot should be available");
+    assert_eq!(resumed.state, TransportState::Playing);
+    assert!(resumed.samples > paused.samples);
+
+    graph
+        .transport_seek_to_seconds(Seconds::from_seconds_f64(2.0))
+        .expect("transport seek should succeed");
+    let seeked = graph
+        .transport_snapshot()
+        .expect("transport snapshot should be available");
+    assert_eq!(seeked.seconds.to_samples(sample_rate as u64), 200);
+}
+
+#[test]
+fn transport_seek_beats_uses_musical_time_map() {
+    let sample_rate = 100;
+    let block_size = 10;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let _run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+        },
+    );
+
+    graph
+        .change_musical_time_map(|map| {
+            map.replace(0, TempoChange::NewTempo { bpm: 120.0 });
+        })
+        .expect("tempo map update should succeed");
+    graph
+        .transport_seek_to_beats(Beats::from_beats(4))
+        .expect("transport seek in beats should succeed");
+
+    let snapshot = graph
+        .transport_snapshot()
+        .expect("transport snapshot should be available");
+    assert_eq!(snapshot.beats, Some(Beats::from_beats(4)));
+    // 120 bpm => one beat is 0.5 seconds, 4 beats = 2 seconds.
+    assert_eq!(snapshot.seconds.to_samples(sample_rate as u64), 200);
+}
+
+#[test]
+fn transport_schedule_while_paused_applies_after_resume() {
+    let sample_rate = 8;
+    let block_size = 4;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let node = graph.push(ValueGen);
+    graph
+        .connect(constant(0.0).to(node).to_label("value"))
+        .expect("connection should succeed");
+    graph
+        .connect(node.to_graph_out())
+        .expect("connection should succeed");
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+        },
+    );
+
+    graph.update();
+    run_graph.process_block();
+    assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 0.0);
+
+    graph
+        .transport_pause()
+        .expect("transport pause should succeed");
+    graph
+        .schedule_change(ParameterChange::duration_from_now(
+            node.input("value"),
+            1.0,
+            Duration::from_secs_f64(0.5),
+        ))
+        .expect("schedule while paused should succeed");
+
+    for _ in 0..3 {
+        graph.update();
+        run_graph.process_block();
+        assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 0.0);
+    }
+
+    graph
+        .transport_play()
+        .expect("transport play should succeed");
+    graph.update();
+    run_graph.process_block();
+    assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 0.0);
+
+    graph.update();
+    run_graph.process_block();
+    assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 1.0);
+}
+
+#[test]
+fn transport_seek_forward_drops_dense_future_queue() {
+    let sample_rate = 100;
+    let block_size = 10;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let node = graph.push(ValueGen);
+    graph
+        .connect(constant(0.0).to(node).to_label("value"))
+        .expect("connection should succeed");
+    graph
+        .connect(node.to_graph_out())
+        .expect("connection should succeed");
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+        },
+    );
+
+    graph
+        .transport_pause()
+        .expect("transport pause should succeed");
+    for i in 1..=64 {
+        graph
+            .schedule_change(ParameterChange::duration_from_now(
+                node.input("value"),
+                i as f32,
+                Duration::from_millis((i * 20) as u64),
+            ))
+            .expect("scheduling dense queue should succeed");
+    }
+    graph
+        .transport_seek_to_seconds(Seconds::from_seconds_f64(20.0))
+        .expect("seek forward should succeed");
+    graph
+        .transport_play()
+        .expect("transport play should succeed");
+
+    for _ in 0..8 {
+        graph.update();
+        run_graph.process_block();
+        assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 0.0);
+    }
+
+    graph
+        .transport_seek_to_seconds(Seconds::ZERO)
+        .expect("seek back should succeed");
+    graph
+        .schedule_change(ParameterChange::duration_from_now(
+            node.input("value"),
+            2.0,
+            Duration::from_millis(100),
+        ))
+        .expect("schedule after seek back should succeed");
+    graph.update();
+    run_graph.process_block();
+    graph.update();
+    run_graph.process_block();
+    assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 2.0);
+}
+
+#[test]
+fn transport_play_pause_seek_stress_does_not_break_snapshot() {
+    let sample_rate = 100;
+    let block_size = 5;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+        },
+    );
+
+    for i in 0..200 {
+        match i % 3 {
+            0 => graph.transport_pause().expect("pause should succeed"),
+            1 => graph.transport_play().expect("play should succeed"),
+            _ => {}
+        }
+        let target = Seconds::from_seconds_f64(((i * 7) % 300) as f64 / 1_000.0);
+        graph
+            .transport_seek_to_seconds(target)
+            .expect("seek should succeed");
+        graph.update();
+        run_graph.process_block();
+
+        let snapshot = graph
+            .transport_snapshot()
+            .expect("transport snapshot should be available");
+        let target_samples = target.to_samples(sample_rate as u64);
+        let expected_samples = match snapshot.state {
+            TransportState::Paused => target_samples,
+            TransportState::Playing => target_samples + block_size as u64,
+        };
+        assert_eq!(
+            snapshot.seconds.to_samples(sample_rate as u64),
+            expected_samples
+        );
+    }
+}
+
+#[test]
+fn transport_long_run_has_no_clock_drift() {
+    let sample_rate = 1_000;
+    let block_size = 10;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+        },
+    );
+
+    let blocks = 500;
+    for _ in 0..blocks {
+        graph.update();
+        run_graph.process_block();
+    }
+
+    let snapshot = graph
+        .transport_snapshot()
+        .expect("transport snapshot should be available");
+    let expected_samples = (blocks * block_size) as u64;
+    assert_eq!(snapshot.samples, expected_samples);
+    assert_eq!(
+        snapshot.seconds.to_samples(sample_rate as u64),
+        expected_samples
+    );
 }

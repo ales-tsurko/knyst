@@ -16,10 +16,11 @@ use std::{
 
 use crate::{
     buffer::Buffer,
-    graph::{NodeChanges, ScheduleError, Time},
+    graph::{NodeChanges, ScheduleError, Time, TransportSnapshot},
     inspection::GraphInspection,
     knyst_commands,
     resources::{BufferId, ResourcesCommand, ResourcesResponse, WavetableId},
+    time::Seconds,
     wavetable_aa::Wavetable,
 };
 use crate::{
@@ -59,6 +60,11 @@ enum Command {
     ChangeMusicalTimeMap(Box<dyn FnOnce(&mut MusicalTimeMap) + Send>),
     ScheduleBeatCallback(BeatCallback, StartBeat),
     RequestInspection(std::sync::mpsc::SyncSender<GraphInspection>),
+    RequestTransportSnapshot(std::sync::mpsc::SyncSender<Option<TransportSnapshot>>),
+    TransportPlay,
+    TransportPause,
+    TransportSeekSeconds(Seconds),
+    TransportSeekBeats(Beats),
     ReportError(KnystError),
 }
 impl std::fmt::Debug for Command {
@@ -94,6 +100,18 @@ impl std::fmt::Debug for Command {
             Self::RequestInspection(arg0) => {
                 f.debug_tuple("RequestInspection").field(arg0).finish()
             }
+            Self::RequestTransportSnapshot(arg0) => f
+                .debug_tuple("RequestTransportSnapshot")
+                .field(arg0)
+                .finish(),
+            Self::TransportPlay => write!(f, "TransportPlay"),
+            Self::TransportPause => write!(f, "TransportPause"),
+            Self::TransportSeekSeconds(arg0) => {
+                f.debug_tuple("TransportSeekSeconds").field(arg0).finish()
+            }
+            Self::TransportSeekBeats(arg0) => {
+                f.debug_tuple("TransportSeekBeats").field(arg0).finish()
+            }
             Self::ReportError(arg0) => f.debug_tuple("ReportError").field(arg0).finish(),
             Command::SetMortality { node, is_mortal } => f
                 .debug_tuple("SetMortality")
@@ -113,6 +131,9 @@ pub enum ControllerError {
     /// Sending a graph inspection response failed because the receiver dropped.
     #[error("Failed to send graph inspection response because the receiver was dropped.")]
     InspectionResponseChannelClosed,
+    /// Sending a transport snapshot response failed because the receiver dropped.
+    #[error("Failed to send transport snapshot response because the receiver was dropped.")]
+    TransportSnapshotResponseChannelClosed,
 }
 
 /// [`KnystCommands`] sends commands to the [`Controller`] which should hold the
@@ -200,6 +221,18 @@ pub trait KnystCommands {
     );
     /// Request a [`GraphInspection`] of the top level graph which will be sent back in the returned channel
     fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection>;
+    /// Start transport playback.
+    fn transport_play(&mut self);
+    /// Pause transport playback.
+    fn transport_pause(&mut self);
+    /// Seek transport to an absolute seconds position.
+    fn transport_seek_to_seconds(&mut self, position: Seconds);
+    /// Seek transport to an absolute beats position.
+    fn transport_seek_to_beats(&mut self, position: Beats);
+    /// Request current transport state and position.
+    fn request_transport_snapshot(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>>;
 
     /// Return the [`GraphSettings`] of the top level graph. This means you
     /// don't have to manually keep track of matching sample rate and block size
@@ -652,6 +685,40 @@ impl KnystCommands for MultiThreadedKnystCommands {
         receiver
     }
 
+    fn transport_play(&mut self) {
+        if let Err(error) = self.send_command(Command::TransportPlay) {
+            self.report_error(error);
+        }
+    }
+
+    fn transport_pause(&mut self) {
+        if let Err(error) = self.send_command(Command::TransportPause) {
+            self.report_error(error);
+        }
+    }
+
+    fn transport_seek_to_seconds(&mut self, position: Seconds) {
+        if let Err(error) = self.send_command(Command::TransportSeekSeconds(position)) {
+            self.report_error(error);
+        }
+    }
+
+    fn transport_seek_to_beats(&mut self, position: Beats) {
+        if let Err(error) = self.send_command(Command::TransportSeekBeats(position)) {
+            self.report_error(error);
+        }
+    }
+
+    fn request_transport_snapshot(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        if let Err(error) = self.send_command(Command::RequestTransportSnapshot(sender)) {
+            self.report_error(error);
+        }
+        receiver
+    }
+
     fn to_graph(&mut self, graph_id: GraphId) {
         self.selected_graph_remote_graph = graph_id;
     }
@@ -993,6 +1060,19 @@ impl Controller {
             Command::RequestInspection(sender) => sender
                 .send(self.top_level_graph.generate_inspection())
                 .map_err(|_| ControllerError::InspectionResponseChannelClosed.into()),
+            Command::RequestTransportSnapshot(sender) => sender
+                .send(self.top_level_graph.transport_snapshot())
+                .map_err(|_| ControllerError::TransportSnapshotResponseChannelClosed.into()),
+            Command::TransportPlay => self.top_level_graph.transport_play().map_err(From::from),
+            Command::TransportPause => self.top_level_graph.transport_pause().map_err(From::from),
+            Command::TransportSeekSeconds(position) => self
+                .top_level_graph
+                .transport_seek_to_seconds(position)
+                .map_err(From::from),
+            Command::TransportSeekBeats(position) => self
+                .top_level_graph
+                .transport_seek_to_beats(position)
+                .map_err(From::from),
             Command::ReportError(error) => Err(error),
             Command::SetMortality { node, is_mortal } => self
                 .top_level_graph
@@ -1353,6 +1433,38 @@ mod tests {
     }
 
     #[test]
+    fn request_transport_snapshot_reports_dropped_receiver() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+
+        controller.apply_command(Command::RequestTransportSnapshot(sender));
+
+        let errors = errors
+            .lock()
+            .expect("test error sink lock should not be poisoned");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            KnystError::ControllerError(ControllerError::TransportSnapshotResponseChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn request_transport_snapshot_returns_none_without_running_scheduler() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+        controller.apply_command(Command::RequestTransportSnapshot(sender));
+        let snapshot = receiver
+            .recv()
+            .expect("transport snapshot response should be sent");
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
     fn report_error_command_forwards_to_error_handler() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
@@ -1383,6 +1495,11 @@ mod tests {
             commands.free_node(NodeId::new(graph_id));
             commands.change_musical_time_map(|_| {});
             let _ = commands.request_inspection();
+            commands.transport_play();
+            commands.transport_pause();
+            commands.transport_seek_to_seconds(Seconds::ZERO);
+            commands.transport_seek_to_beats(Beats::ZERO);
+            let _ = commands.request_transport_snapshot();
         }));
 
         assert!(result.is_ok());

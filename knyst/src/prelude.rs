@@ -10,7 +10,7 @@ pub use crate::graph::{
     connection::constant,
     connection::{ConnectionBundle, InputBundle},
     gen, Connection, Graph, GraphInput, GraphSettings, Mult, NodeId, ParameterChange,
-    RunGraphSettings,
+    RunGraphSettings, TransportSnapshot, TransportState,
 };
 pub use crate::handles::{
     bus, graph_input, graph_output, handle, GenericHandle, GraphHandle, Handle, HandleData,
