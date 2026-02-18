@@ -29,13 +29,13 @@ impl Gen for SubGen {
             let value1 = ctx.inputs.get_channel(i * 2 + 1);
 
             // fallback
-            #[cfg(not(feature = "unstable"))]
+            #[cfg(not(all(feature = "unstable", knyst_nightly)))]
             {
                 for i in 0..block_size {
                     product[i] = value0[i] - value1[i];
                 }
             }
-            #[cfg(feature = "unstable")]
+            #[cfg(all(feature = "unstable", knyst_nightly))]
             {
                 use std::simd::f32x2;
                 let simd_width = 2;
@@ -209,13 +209,13 @@ impl Gen for MulGen {
             let value1 = ctx.inputs.get_channel(i * 2 + 1);
 
             // fallback
-            #[cfg(not(feature = "unstable"))]
+            #[cfg(not(all(feature = "unstable", knyst_nightly)))]
             {
                 for i in 0..block_size {
                     product[i] = value0[i] * value1[i];
                 }
             }
-            #[cfg(feature = "unstable")]
+            #[cfg(all(feature = "unstable", knyst_nightly))]
             {
                 use std::simd::f32x2;
                 let simd_width = 2;

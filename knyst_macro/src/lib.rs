@@ -726,9 +726,7 @@ fn parse_parameter(param: &PatType, name: &Ident) -> Result<Parameter> {
                                 })
                             }
                         }
-                        _ => {
-                            return Err(syn::Error::new(slice_type.elem.span(), "Unknown input"));
-                        }
+                        _ => Err(syn::Error::new(slice_type.elem.span(), "Unknown input")),
                     }
                 }
                 Type::Path(ty_path) => {

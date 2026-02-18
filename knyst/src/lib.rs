@@ -49,7 +49,7 @@
 #![deny(rustdoc::broken_intra_doc_links)] // error if there are broken intra-doc links
 #![warn(missing_docs)]
 // #![warn(clippy::pedantic)]
-#![cfg_attr(feature = "unstable", feature(portable_simd))]
+#![cfg_attr(all(feature = "unstable", knyst_nightly), feature(portable_simd))]
 
 #[allow(unused)]
 use crate::audio_backend::AudioBackend;

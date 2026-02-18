@@ -65,6 +65,9 @@ tokio = { version = "1.26.0", features = [
 ] }
 trybuild = { version = "1.0", features = ["diff"] }
 
+[build-dependencies]
+rustc_version = "0.4"
+
 [target.'cfg(unix)'.dev-dependencies]
 termion = "2.0.3"
 

@@ -84,6 +84,20 @@ pub enum AudioBackendError {
         graph_outputs: usize,
         backend_outputs: usize,
     },
+    #[error(
+        "Graph input channel count ({graph_inputs}) exceeds backend input channels ({backend_inputs})."
+    )]
+    GraphInputChannelsMismatch {
+        graph_inputs: usize,
+        backend_inputs: usize,
+    },
+    #[error(
+        "CPAL input sample rate ({input_sample_rate}) does not match output sample rate ({output_sample_rate})."
+    )]
+    CpalInputOutputSampleRateMismatch {
+        input_sample_rate: usize,
+        output_sample_rate: usize,
+    },
     #[error("No output device was found for CPAL selection: {0}")]
     OutputDeviceNotFound(String),
     #[error(transparent)]
@@ -110,8 +124,19 @@ pub enum AudioBackendError {
     #[error(transparent)]
     CpalPlayStreamError(#[from] cpal::PlayStreamError),
     #[cfg(feature = "cpal")]
+    #[error(transparent)]
+    CpalPauseStreamError(#[from] cpal::PauseStreamError),
+    #[cfg(feature = "cpal")]
     #[error("Unsupported CPAL sample format: {0:?}")]
     UnsupportedSampleFormat(cpal::SampleFormat),
+    #[cfg(feature = "jack")]
+    #[error(
+        "JACK sample rate changed from {expected_sample_rate} to {actual_sample_rate} while running."
+    )]
+    JackSampleRateChanged {
+        expected_sample_rate: usize,
+        actual_sample_rate: usize,
+    },
 }
 
 #[cfg(feature = "jack")]
@@ -191,8 +216,8 @@ mod jack_backend {
                     out_ports,
                 };
                 // Activate the client, which starts the processing.
-                let active_client =
-                    client.activate_async(JackNotifications::default(), jack_process)?;
+                let active_client = client
+                    .activate_async(JackNotifications::new(self.sample_rate), jack_process)?;
                 self.client = Some(JackClient::Active(active_client));
                 let controller = Controller::new(
                     graph,
@@ -314,10 +339,26 @@ mod jack_backend {
         }
     }
 
-    struct JackNotifications;
-    impl Default for JackNotifications {
-        fn default() -> Self {
-            Self
+    struct JackNotifications {
+        expected_sample_rate: usize,
+    }
+
+    impl JackNotifications {
+        fn new(expected_sample_rate: usize) -> Self {
+            Self {
+                expected_sample_rate,
+            }
+        }
+    }
+
+    fn jack_sample_rate_control(
+        expected_sample_rate: usize,
+        actual_sample_rate: usize,
+    ) -> jack::Control {
+        if actual_sample_rate == expected_sample_rate {
+            jack::Control::Continue
+        } else {
+            jack::Control::Quit
         }
     }
 
@@ -328,9 +369,8 @@ mod jack_backend {
 
         fn freewheel(&mut self, _: &jack::Client, _is_enabled: bool) {}
 
-        fn sample_rate(&mut self, _: &jack::Client, _srate: jack::Frames) -> jack::Control {
-            // println!("JACK: sample rate changed to {}", srate);
-            jack::Control::Continue
+        fn sample_rate(&mut self, _: &jack::Client, srate: jack::Frames) -> jack::Control {
+            jack_sample_rate_control(self.expected_sample_rate, srate as usize)
         }
 
         fn client_registration(&mut self, _: &jack::Client, _name: &str, _is_reg: bool) {
@@ -392,6 +432,27 @@ mod jack_backend {
             jack::Control::Continue
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::jack_sample_rate_control;
+
+        #[test]
+        fn jack_sample_rate_control_continues_on_match() {
+            assert!(matches!(
+                jack_sample_rate_control(48_000, 48_000),
+                jack::Control::Continue
+            ));
+        }
+
+        #[test]
+        fn jack_sample_rate_control_quits_on_change() {
+            assert!(matches!(
+                jack_sample_rate_control(48_000, 44_100),
+                jack::Control::Quit
+            ));
+        }
+    }
 }
 
 /// [`AudioBackend`] implementation for CPAL
@@ -406,12 +467,14 @@ pub mod cpal_backend {
     #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
     use assert_no_alloc::*;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::Sample as CpalSampleTrait;
 
     #[allow(missing_docs)]
     pub struct CpalBackendOptions {
         pub device: String,
         pub verbose: bool,
     }
+
     impl Default for CpalBackendOptions {
         fn default() -> Self {
             Self {
@@ -420,9 +483,15 @@ pub mod cpal_backend {
             }
         }
     }
-    /// CPAL backend for convenience. The CPAL backend currently does not support passing on audio inputs from outside the program.
+
+    struct CpalStreams {
+        output_stream: cpal::Stream,
+        input_stream: Option<cpal::Stream>,
+    }
+
+    /// CPAL backend for convenience.
     pub struct CpalBackend {
-        stream: Option<cpal::Stream>,
+        streams: Option<CpalStreams>,
         sample_rate: usize,
         config: cpal::SupportedStreamConfig,
         device: cpal::Device,
@@ -450,7 +519,7 @@ pub mod cpal_backend {
                 println!("Default output config: {:?}", config);
             }
             Ok(Self {
-                stream: None,
+                streams: None,
                 sample_rate: config.sample_rate().0 as usize,
                 config,
                 device,
@@ -462,6 +531,39 @@ pub mod cpal_backend {
         }
     }
 
+    fn validate_cpal_configuration(
+        graph_outputs: usize,
+        backend_outputs: usize,
+        graph_inputs: usize,
+        backend_inputs: usize,
+        output_sample_rate: usize,
+        input_sample_rate: Option<usize>,
+    ) -> Result<(), AudioBackendError> {
+        if graph_outputs != backend_outputs {
+            return Err(AudioBackendError::GraphOutputChannelsMismatch {
+                graph_outputs,
+                backend_outputs,
+            });
+        }
+        if graph_inputs > backend_inputs {
+            return Err(AudioBackendError::GraphInputChannelsMismatch {
+                graph_inputs,
+                backend_inputs,
+            });
+        }
+        if graph_inputs > 0 {
+            if let Some(input_sample_rate) = input_sample_rate {
+                if input_sample_rate != output_sample_rate {
+                    return Err(AudioBackendError::CpalInputOutputSampleRateMismatch {
+                        input_sample_rate,
+                        output_sample_rate,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     impl AudioBackend for CpalBackend {
         fn start_processing_return_controller(
             &mut self,
@@ -470,37 +572,166 @@ pub mod cpal_backend {
             run_graph_settings: RunGraphSettings,
             error_handler: Box<dyn FnMut(KnystError) + Send + 'static>,
         ) -> Result<crate::controller::Controller, AudioBackendError> {
-            if self.stream.is_some() {
+            if self.streams.is_some() {
                 return Err(AudioBackendError::BackendAlreadyRunning);
             }
-            let backend_outputs = self.config.channels() as usize;
+            let output_config = self.config.clone();
             let graph_outputs = graph.num_outputs();
-            if graph_outputs != backend_outputs {
-                return Err(AudioBackendError::GraphOutputChannelsMismatch {
-                    graph_outputs,
-                    backend_outputs,
-                });
-            }
-            if graph.num_inputs() > 0 {
-                eprintln!("Warning: CpalBackend currently does not support inputs into the top level Graph.")
-            }
+            let graph_inputs = graph.num_inputs();
+            let backend_outputs = output_config.channels() as usize;
+            let input_config = self.device.default_input_config().ok();
+            let backend_inputs = input_config
+                .as_ref()
+                .map(|config| config.channels() as usize)
+                .unwrap_or(0);
+            let output_sample_rate = output_config.sample_rate().0 as usize;
+            let input_sample_rate = input_config
+                .as_ref()
+                .map(|config| config.sample_rate().0 as usize);
+
+            validate_cpal_configuration(
+                graph_outputs,
+                backend_outputs,
+                graph_inputs,
+                backend_inputs,
+                output_sample_rate,
+                input_sample_rate,
+            )?;
+
+            let (mut input_producer, mut input_consumer) = if graph_inputs > 0 {
+                let queue_capacity = (graph_inputs * 8_192).next_power_of_two();
+                let (producer, consumer) = rtrb::RingBuffer::<Sample>::new(queue_capacity);
+                (Some(producer), Some(consumer))
+            } else {
+                (None, None)
+            };
+
+            let stream_config: cpal::StreamConfig = output_config.clone().into();
+            let graph_input_channels = graph_inputs;
             let (run_graph, resources_command_sender, resources_command_receiver) =
                 RunGraph::new(&mut graph, resources, run_graph_settings)?;
-            let config = self.config.clone();
-            let stream = match self.config.sample_format() {
-                cpal::SampleFormat::F32 => run::<f32>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::I16 => run::<i16>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::U16 => run::<u16>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::I8 => run::<i8>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::I32 => run::<i32>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::I64 => run::<i64>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::U8 => run::<u8>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::U32 => run::<u32>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::U64 => run::<u64>(&self.device, &config.into(), run_graph),
-                cpal::SampleFormat::F64 => run::<f64>(&self.device, &config.into(), run_graph),
+            let output_stream = match output_config.sample_format() {
+                cpal::SampleFormat::F32 => run_output::<f32>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::I16 => run_output::<i16>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::U16 => run_output::<u16>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::I8 => run_output::<i8>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::I32 => run_output::<i32>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::I64 => run_output::<i64>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::U8 => run_output::<u8>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::U32 => run_output::<u32>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::U64 => run_output::<u64>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
+                cpal::SampleFormat::F64 => run_output::<f64>(
+                    &self.device,
+                    &stream_config,
+                    run_graph,
+                    graph_input_channels,
+                    input_consumer.take(),
+                ),
                 other => Err(AudioBackendError::UnsupportedSampleFormat(other)),
             }?;
-            self.stream = Some(stream);
+
+            let input_stream = if graph_inputs > 0 {
+                let input_config =
+                    input_config.expect("input config should exist after validation");
+                let input_stream_config: cpal::StreamConfig = input_config.clone().into();
+                let input_producer = input_producer
+                    .take()
+                    .expect("input producer should exist after validation");
+                Some(match input_config.sample_format() {
+                    cpal::SampleFormat::F32 => {
+                        run_input::<f32>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::I16 => {
+                        run_input::<i16>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::U16 => {
+                        run_input::<u16>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::I8 => {
+                        run_input::<i8>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::I32 => {
+                        run_input::<i32>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::I64 => {
+                        run_input::<i64>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::U8 => {
+                        run_input::<u8>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::U32 => {
+                        run_input::<u32>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::U64 => {
+                        run_input::<u64>(&self.device, &input_stream_config, input_producer)
+                    }
+                    cpal::SampleFormat::F64 => {
+                        run_input::<f64>(&self.device, &input_stream_config, input_producer)
+                    }
+                    other => Err(AudioBackendError::UnsupportedSampleFormat(other)),
+                }?)
+            } else {
+                None
+            };
+
+            self.streams = Some(CpalStreams {
+                output_stream,
+                input_stream,
+            });
             let controller = Controller::new(
                 graph,
                 error_handler,
@@ -511,10 +742,21 @@ pub mod cpal_backend {
         }
 
         fn stop(&mut self) -> Result<(), AudioBackendError> {
-            if let Some(stream) = self.stream.take() {
-                // Not all platforms support pause; dropping the stream still stops playback.
-                let _ = stream.pause();
-                Ok(())
+            if let Some(streams) = self.streams.take() {
+                let mut pause_error = None;
+                if let Some(input_stream) = &streams.input_stream {
+                    if let Err(error) = input_stream.pause() {
+                        pause_error = Some(error);
+                    }
+                }
+                if let Err(error) = streams.output_stream.pause() {
+                    pause_error = Some(error);
+                }
+                if let Some(error) = pause_error {
+                    Err(error.into())
+                } else {
+                    Ok(())
+                }
             } else {
                 Err(AudioBackendError::BackendNotRunning)
             }
@@ -533,18 +775,25 @@ pub mod cpal_backend {
         }
 
         fn native_input_channels(&self) -> Option<usize> {
-            // TODO: support duplex streams
-            Some(0)
+            Some(
+                self.device
+                    .default_input_config()
+                    .ok()
+                    .map(|config| config.channels() as usize)
+                    .unwrap_or(0),
+            )
         }
     }
 
-    fn run<T>(
+    fn run_output<T>(
         device: &cpal::Device,
         config: &cpal::StreamConfig,
         mut run_graph: RunGraph,
+        graph_input_channels: usize,
+        mut input_consumer: Option<rtrb::Consumer<Sample>>,
     ) -> Result<cpal::Stream, AudioBackendError>
     where
-        T: cpal::Sample + cpal::FromSample<Sample> + cpal::SizedSample + std::fmt::Display,
+        T: cpal::Sample + cpal::FromSample<Sample> + cpal::SizedSample,
     {
         let channels = config.channels as usize;
 
@@ -558,44 +807,38 @@ pub mod cpal_backend {
         let stream = device.build_output_stream(
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
-                // TODO: When CPAL support duplex streams, copy inputs to graph inputs here.
-                #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
-                {
-                    assert_no_alloc(|| {
-                        for frame in output.chunks_mut(channels) {
-                            if sample_counter >= graph_block_size {
-                                run_graph.run_resources_communication(50);
-                                run_graph.process_block();
-                                sample_counter = 0;
-                            }
-                            let buffer = run_graph.graph_output_buffers();
-                            // println!("{}", T::from_sample(buffer.read(0, sample_counter)));
-                            for (channel_i, out) in frame.iter_mut().enumerate() {
-                                let value: T =
-                                    T::from_sample(buffer.read(channel_i, sample_counter));
-                                *out = value;
-                            }
-                            sample_counter += 1;
-                        }
-                    })
-                }
-                #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
-                {
+                let process = || {
                     for frame in output.chunks_mut(channels) {
                         if sample_counter >= graph_block_size {
                             run_graph.run_resources_communication(50);
                             run_graph.process_block();
                             sample_counter = 0;
                         }
-                        let buffer = run_graph.graph_output_buffers();
-                        // println!("{}", T::from_sample(buffer.read(0, sample_counter)));
-                        for (channel_i, out) in frame.iter_mut().enumerate() {
-                            let value: T = T::from_sample(buffer.read(channel_i, sample_counter));
-                            *out = value;
+                        if graph_input_channels > 0 {
+                            let graph_input_buffers = run_graph.graph_input_buffers();
+                            for channel_i in 0..graph_input_channels {
+                                let value = input_consumer
+                                    .as_mut()
+                                    .and_then(|consumer| consumer.pop().ok())
+                                    .unwrap_or(0.0);
+                                graph_input_buffers.write(value, channel_i, sample_counter);
+                            }
+                        }
+                        {
+                            let buffer = run_graph.graph_output_buffers();
+                            for (channel_i, out) in frame.iter_mut().enumerate() {
+                                let value: T =
+                                    T::from_sample(buffer.read(channel_i, sample_counter));
+                                *out = value;
+                            }
                         }
                         sample_counter += 1;
                     }
-                }
+                };
+                #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
+                assert_no_alloc(process);
+                #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
+                process();
             },
             err_fn,
             None,
@@ -603,5 +846,87 @@ pub mod cpal_backend {
 
         stream.play()?;
         Ok(stream)
+    }
+
+    fn run_input<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        mut input_producer: rtrb::Producer<Sample>,
+    ) -> Result<cpal::Stream, AudioBackendError>
+    where
+        T: cpal::Sample + cpal::SizedSample,
+        Sample: cpal::FromSample<T>,
+    {
+        let input_channels = config.channels as usize;
+        let err_fn = |err| eprintln!("an error occurred on input stream: {}", err);
+        let stream = device.build_input_stream(
+            config,
+            move |input: &[T], _: &cpal::InputCallbackInfo| {
+                let process = || {
+                    for frame in input.chunks(input_channels) {
+                        for sample in frame {
+                            let value = <Sample as CpalSampleTrait>::from_sample(*sample);
+                            let _ = input_producer.push(value);
+                        }
+                    }
+                };
+                #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
+                assert_no_alloc(process);
+                #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
+                process();
+            },
+            err_fn,
+            None,
+        )?;
+        stream.play()?;
+        Ok(stream)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::validate_cpal_configuration;
+        use crate::audio_backend::AudioBackendError;
+
+        #[test]
+        fn validate_cpal_configuration_rejects_output_mismatch() {
+            let result = validate_cpal_configuration(2, 1, 0, 0, 48_000, None);
+            assert!(matches!(
+                result,
+                Err(AudioBackendError::GraphOutputChannelsMismatch {
+                    graph_outputs: 2,
+                    backend_outputs: 1
+                })
+            ));
+        }
+
+        #[test]
+        fn validate_cpal_configuration_rejects_input_mismatch() {
+            let result = validate_cpal_configuration(2, 2, 2, 1, 48_000, Some(48_000));
+            assert!(matches!(
+                result,
+                Err(AudioBackendError::GraphInputChannelsMismatch {
+                    graph_inputs: 2,
+                    backend_inputs: 1
+                })
+            ));
+        }
+
+        #[test]
+        fn validate_cpal_configuration_rejects_sample_rate_mismatch() {
+            let result = validate_cpal_configuration(2, 2, 1, 1, 48_000, Some(44_100));
+            assert!(matches!(
+                result,
+                Err(AudioBackendError::CpalInputOutputSampleRateMismatch {
+                    input_sample_rate: 44_100,
+                    output_sample_rate: 48_000
+                })
+            ));
+        }
+
+        #[test]
+        fn validate_cpal_configuration_accepts_valid_setup() {
+            let result = validate_cpal_configuration(2, 2, 1, 2, 48_000, Some(48_000));
+            assert!(result.is_ok());
+        }
     }
 }
