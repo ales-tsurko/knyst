@@ -9,8 +9,8 @@ pub use crate::gen::{Gen, GenContext, GenState, StopAction};
 pub use crate::graph::{
     connection::constant,
     connection::{ConnectionBundle, InputBundle},
-    gen, Connection, Graph, GraphInput, GraphSettings, Mult, NodeId, ParameterChange,
-    RunGraphSettings, TransportSnapshot, TransportState,
+    gen, Connection, Graph, GraphInput, GraphSettings, Mult, NodeId, ObservabilitySnapshot,
+    ParameterChange, RunGraphSettings, TransportSnapshot, TransportState,
 };
 pub use crate::handles::{
     bus, graph_input, graph_output, handle, GenericHandle, GraphHandle, Handle, HandleData,

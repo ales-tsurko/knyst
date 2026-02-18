@@ -44,7 +44,9 @@ use connection::ConnectionError;
 use node::Node;
 pub use run_graph::{RunGraph, RunGraphSettings};
 
-use crate::inspection::{EdgeInspection, EdgeSource, GraphInspection, NodeInspection};
+use crate::inspection::{
+    EdgeInspection, EdgeSource, FeedbackEdgeInspection, GraphInspection, NodeInspection,
+};
 use crate::scheduling::MusicalTimeMap;
 use crate::time::{Beats, Seconds};
 use rtrb::RingBuffer;
@@ -53,7 +55,7 @@ use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
@@ -400,6 +402,70 @@ pub struct TransportSnapshot {
     pub seconds: Seconds,
     /// Position in beats, if the tempo map can be read.
     pub beats: Option<Beats>,
+}
+
+/// Snapshot of runtime observability metrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObservabilitySnapshot {
+    /// Current callback load ratio (`1.0` means exactly one block budget).
+    pub load_ratio: f32,
+    /// Peak callback load ratio observed since engine start.
+    pub peak_load_ratio: f32,
+    /// Number of detected callback-overrun/dropout-like issues.
+    pub dropout_count: u64,
+}
+
+#[derive(Debug)]
+struct ObservabilityState {
+    /// Current callback load in fixed-point ratio * 10000.
+    load_ratio_x10000: AtomicU32,
+    /// Peak callback load in fixed-point ratio * 10000.
+    peak_load_ratio_x10000: AtomicU32,
+    dropout_count: AtomicU64,
+}
+
+impl ObservabilityState {
+    fn new() -> Self {
+        Self {
+            load_ratio_x10000: AtomicU32::new(0),
+            peak_load_ratio_x10000: AtomicU32::new(0),
+            dropout_count: AtomicU64::new(0),
+        }
+    }
+
+    fn update_load(&self, callback_seconds: f64, block_seconds: f64) {
+        if block_seconds <= 0.0 {
+            return;
+        }
+        let load_ratio_x10000 =
+            ((callback_seconds / block_seconds) * 10_000.0).clamp(0.0, u32::MAX as f64) as u32;
+        self.load_ratio_x10000
+            .store(load_ratio_x10000, Ordering::Relaxed);
+        let mut peak = self.peak_load_ratio_x10000.load(Ordering::Relaxed);
+        while load_ratio_x10000 > peak {
+            match self.peak_load_ratio_x10000.compare_exchange_weak(
+                peak,
+                load_ratio_x10000,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(new_peak) => peak = new_peak,
+            }
+        }
+    }
+
+    fn increment_dropouts(&self, count: u64) {
+        self.dropout_count.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ObservabilitySnapshot {
+        ObservabilitySnapshot {
+            load_ratio: self.load_ratio_x10000.load(Ordering::Relaxed) as f32 / 10_000.0,
+            peak_load_ratio: self.peak_load_ratio_x10000.load(Ordering::Relaxed) as f32 / 10_000.0,
+            dropout_count: self.dropout_count.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Newtype for using a [`Time`] as an offset.
@@ -2033,6 +2099,23 @@ impl Graph {
                 });
             }
         }
+        let mut feedback_edges = Vec::new();
+        for (_feedback_node, edges) in &self.node_feedback_edges {
+            for edge in edges {
+                let source_index = node_key_processed.iter().position(|&k| k == edge.source);
+                let destination_index = node_key_processed
+                    .iter()
+                    .position(|&k| k == edge.feedback_destination);
+                if let (Some(source), Some(destination)) = (source_index, destination_index) {
+                    feedback_edges.push(FeedbackEdgeInspection {
+                        source,
+                        destination,
+                        from_index: edge.from_output_index,
+                        to_index: edge.to_input_index,
+                    });
+                }
+            }
+        }
         let unconnected_nodes = self
             .disconnected_nodes
             .iter()
@@ -2056,6 +2139,7 @@ impl Graph {
             unconnected_nodes,
             nodes_pending_removal,
             graph_output_input_edges,
+            feedback_edges,
             num_inputs: self.num_inputs,
             num_outputs: self.num_outputs,
             graph_id: self.id,
@@ -3225,6 +3309,20 @@ impl Graph {
             .as_ref()
             .and_then(|ggc| ggc.scheduler.transport_snapshot())
     }
+
+    /// Query current runtime observability metrics.
+    #[must_use]
+    pub fn observability_snapshot(&self) -> Option<ObservabilitySnapshot> {
+        self.graph_gen_communicator
+            .as_ref()
+            .map(|ggc| ggc.observability.snapshot())
+    }
+
+    pub(crate) fn increment_dropout_count(&self, count: u64) {
+        if let Some(ggc) = &self.graph_gen_communicator {
+            ggc.observability.increment_dropouts(count);
+        }
+    }
     /// Goes through all of the nodes that are connected to nodes in `nodes_to_process` and adds them to the list in
     /// reverse depth first order.
     ///
@@ -3529,6 +3627,7 @@ impl Graph {
         let (clock_update_producer, clock_update_consumer) = RingBuffer::new(10);
         let schedule_receiver =
             ScheduleReceiver::new(rb_consumer, clock_update_consumer, scheduler_buffer_size);
+        let observability = Arc::new(ObservabilityState::new());
 
         let graph_gen_communicator = GraphGenCommunicator {
             free_node_queue_consumer,
@@ -3539,6 +3638,7 @@ impl Graph {
             new_task_data_producer,
             next_change_flag: task_data.applied.clone(),
             timestamp: Arc::new(AtomicU64::new(0)),
+            observability: observability.clone(),
         };
 
         let graph_gen = graph_gen::make_graph_gen(graph_gen::GraphGenBuildArgs {
@@ -3558,6 +3658,7 @@ impl Graph {
             task_data_to_be_dropped_producer,
             new_task_data_consumer,
             arc_inputs_buffers_ptr: self.inputs_buffers_ptr.clone(),
+            observability,
         });
         self.graph_gen_communicator = Some(graph_gen_communicator);
         Ok(graph_gen)
@@ -4262,6 +4363,7 @@ struct GraphGenCommunicator {
     /// The ring buffer for sending scheduled changes to the audio thread
     scheduled_change_producer: rtrb::Producer<ScheduledChange>,
     timestamp: Arc<AtomicU64>,
+    observability: Arc<ObservabilityState>,
     /// The next change flag to be attached to a task update. When the changes
     /// in the update have been applied on the audio thread, this flag till be
     /// set to true. Its purpose is to make sure nodes can be safely dropped

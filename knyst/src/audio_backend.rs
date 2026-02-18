@@ -151,11 +151,16 @@ pub enum AudioBackendError {
 mod jack_backend {
     use crate::audio_backend::{AudioBackend, AudioBackendError};
     use crate::controller::Controller;
+    use crate::controller::MultiThreadedKnystCommands;
     use crate::graph::{RunGraph, RunGraphSettings};
     use crate::{graph::Graph, Resources};
     use crate::{KnystError, Sample};
     #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
     use assert_no_alloc::*;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     enum JackClient {
         Passive(jack::Client),
         Active(jack::AsyncClient<JackNotifications, JackProcess>),
@@ -218,21 +223,27 @@ mod jack_backend {
                 }
                 let (run_graph, resources_command_sender, resources_command_receiver) =
                     RunGraph::new(&mut graph, resources, run_graph_settings)?;
-                let jack_process = JackProcess {
-                    run_graph,
-                    in_ports,
-                    out_ports,
-                };
-                // Activate the client, which starts the processing.
-                let active_client = client
-                    .activate_async(JackNotifications::new(self.sample_rate), jack_process)?;
-                self.client = Some(JackClient::Active(active_client));
                 let controller = Controller::new(
                     graph,
                     error_handler,
                     resources_command_sender,
                     resources_command_receiver,
                 );
+                let error_commands = controller.get_knyst_commands();
+                let xrun_counter = Arc::new(AtomicU64::new(0));
+                let jack_process = JackProcess {
+                    run_graph,
+                    in_ports,
+                    out_ports,
+                    xrun_counter: xrun_counter.clone(),
+                    error_commands,
+                };
+                // Activate the client, which starts the processing.
+                let active_client = client.activate_async(
+                    JackNotifications::new(self.sample_rate, xrun_counter),
+                    jack_process,
+                )?;
+                self.client = Some(JackClient::Active(active_client));
                 Ok(controller)
             }
         }
@@ -273,10 +284,16 @@ mod jack_backend {
         run_graph: RunGraph,
         in_ports: Vec<jack::Port<jack::AudioIn>>,
         out_ports: Vec<jack::Port<jack::AudioOut>>,
+        xrun_counter: Arc<AtomicU64>,
+        error_commands: MultiThreadedKnystCommands,
     }
 
     impl jack::ProcessHandler for JackProcess {
         fn process(&mut self, _: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
+            let pending_xruns = self.xrun_counter.swap(0, Ordering::Relaxed);
+            if pending_xruns > 0 {
+                self.error_commands.report_dropouts(pending_xruns);
+            }
             // Duplication due to conditional compilation
             #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
             {
@@ -349,12 +366,14 @@ mod jack_backend {
 
     struct JackNotifications {
         expected_sample_rate: usize,
+        xrun_counter: Arc<AtomicU64>,
     }
 
     impl JackNotifications {
-        fn new(expected_sample_rate: usize) -> Self {
+        fn new(expected_sample_rate: usize, xrun_counter: Arc<AtomicU64>) -> Self {
             Self {
                 expected_sample_rate,
+                xrun_counter,
             }
         }
     }
@@ -436,7 +455,7 @@ mod jack_backend {
         }
 
         fn xrun(&mut self, _: &jack::Client) -> jack::Control {
-            // println!("JACK: xrun occurred");
+            self.xrun_counter.fetch_add(1, Ordering::Relaxed);
             jack::Control::Continue
         }
     }
@@ -943,6 +962,7 @@ pub mod cpal_backend {
                 #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
                 process();
                 if let Some(missing_samples) = underflow_report {
+                    error_commands.report_dropouts(1);
                     error_commands
                         .report_error(AudioBackendError::CpalInputUnderflow { missing_samples });
                 }
@@ -994,6 +1014,7 @@ pub mod cpal_backend {
                 #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
                 process();
                 if let Some(dropped_samples) = overflow_report {
+                    error_commands.report_dropouts(1);
                     error_commands
                         .report_error(AudioBackendError::CpalInputOverflow { dropped_samples });
                 }

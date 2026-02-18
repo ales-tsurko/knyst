@@ -5,8 +5,6 @@
 use crate::graph::NodeId;
 
 /// The metadata of a Graph
-// TODO: Feedback edges
-
 #[derive(Debug, Clone)]
 pub struct GraphInspection {
     /// All the nodes currently in the Graph (including those pending removal)
@@ -17,6 +15,8 @@ pub struct GraphInspection {
     pub nodes_pending_removal: Vec<usize>,
     /// The indices of nodes connected to the graph output(s)
     pub graph_output_input_edges: Vec<EdgeInspection>,
+    /// Feedback edges in the graph.
+    pub feedback_edges: Vec<FeedbackEdgeInspection>,
     /// Number of inputs to the graph
     pub num_inputs: usize,
     /// Number of outputs from the graph
@@ -33,6 +33,7 @@ impl GraphInspection {
             unconnected_nodes: vec![],
             nodes_pending_removal: vec![],
             graph_output_input_edges: vec![],
+            feedback_edges: vec![],
             num_inputs: 0,
             num_outputs: 0,
             graph_id: 0,
@@ -72,4 +73,17 @@ pub struct EdgeInspection {
 pub enum EdgeSource {
     Node(usize),
     Graph,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Metadata for a feedback edge.
+pub struct FeedbackEdgeInspection {
+    /// Source node index in this `GraphInspection`.
+    pub source: usize,
+    /// Destination node index in this `GraphInspection`.
+    pub destination: usize,
+    /// Source output channel index.
+    pub from_index: usize,
+    /// Destination input channel index.
+    pub to_index: usize,
 }

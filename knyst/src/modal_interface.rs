@@ -16,8 +16,8 @@ use crate::controller::{
 };
 use crate::graph::connection::{ConnectionBundle, InputBundle};
 use crate::graph::{
-    Connection, GenOrGraph, GraphId, GraphSettings, NodeId, ParameterChange, SimultaneousChanges,
-    Time, TransportSnapshot,
+    Connection, GenOrGraph, GraphId, GraphSettings, NodeId, ObservabilitySnapshot, ParameterChange,
+    SimultaneousChanges, Time, TransportSnapshot,
 };
 use crate::handles::{GraphHandle, Handle};
 use crate::inspection::GraphInspection;
@@ -178,6 +178,12 @@ impl KnystCommands for SharedKnystCommands {
         &mut self,
     ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>> {
         self.lock().request_transport_snapshot()
+    }
+
+    fn request_observability_snapshot(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>> {
+        self.lock().request_observability_snapshot()
     }
 
     fn default_graph_settings(&self) -> GraphSettings {

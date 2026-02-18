@@ -2,14 +2,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::time::Instant;
 
 use rtrb::Producer;
 
 use crate::{internal_filter::hiir::StandardDownsampler2X, Resources};
 
 use super::{
-    node::Node, Gen, GenContext, GenState, NodeBufferRef, NodeId, NodeKey, Oversampling,
-    OwnedRawBuffer, Sample, ScheduleReceiver, SharedNodeStorage, TaskData,
+    node::Node, Gen, GenContext, GenState, NodeBufferRef, NodeId, NodeKey, ObservabilityState,
+    Oversampling, OwnedRawBuffer, Sample, ScheduleReceiver, SharedNodeStorage, TaskData,
 };
 
 pub(super) struct GraphGenBuildArgs {
@@ -29,6 +30,7 @@ pub(super) struct GraphGenBuildArgs {
     pub task_data_to_be_dropped_producer: rtrb::Producer<TaskData>,
     pub new_task_data_consumer: rtrb::Consumer<TaskData>,
     pub arc_inputs_buffers_ptr: Arc<OwnedRawBuffer>,
+    pub observability: Arc<ObservabilityState>,
 }
 
 pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
@@ -49,6 +51,7 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         task_data_to_be_dropped_producer,
         new_task_data_consumer,
         arc_inputs_buffers_ptr,
+        observability,
     } = args;
 
     let graph_gen = Box::new(GraphGen {
@@ -66,6 +69,7 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         task_data_to_be_dropped_producer,
         new_task_data_consumer,
         _arc_inputs_buffers_ptr: arc_inputs_buffers_ptr,
+        observability,
     });
     // TODO:
     // If the graph is the same as the parent Graph, do no conversion.
@@ -548,6 +552,7 @@ pub(super) struct GraphGen {
     free_node_queue_producer: rtrb::Producer<(NodeKey, GenState)>,
     task_data_to_be_dropped_producer: rtrb::Producer<TaskData>,
     new_task_data_consumer: rtrb::Consumer<TaskData>,
+    observability: Arc<ObservabilityState>,
 }
 
 impl Gen for GraphGen {
@@ -555,6 +560,8 @@ impl Gen for GraphGen {
         "GraphGen"
     }
     fn process(&mut self, ctx: GenContext, resources: &mut Resources) -> GenState {
+        let callback_start = Instant::now();
+        let block_seconds = self.block_size as f64 / self.sample_rate as f64;
         match self.graph_state {
             GenState::Continue => {
                 // TODO: Support output with a different block size, i.e. local buffering and running this graph more or less often than the parent graph
@@ -781,6 +788,12 @@ impl Gen for GraphGen {
             // variants at the Graph level which is this level.
             GenState::FreeGraph(_) => unreachable!(),
             GenState::FreeGraphMendConnections(_) => unreachable!(),
+        }
+        let elapsed_seconds = callback_start.elapsed().as_secs_f64();
+        self.observability
+            .update_load(elapsed_seconds, block_seconds);
+        if elapsed_seconds > block_seconds {
+            self.observability.increment_dropouts(1);
         }
         self.graph_state
     }

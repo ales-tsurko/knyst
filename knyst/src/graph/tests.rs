@@ -239,6 +239,83 @@ fn feedback_in_graph() {
 }
 
 #[test]
+fn inspection_includes_feedback_edges() {
+    let mut graph: Graph = Graph::new(GraphSettings {
+        block_size: 8,
+        ..Default::default()
+    });
+    let source = graph.push(DummyGen { counter: 0.0 });
+    let destination = graph.push(DummyGen { counter: 0.0 });
+
+    graph
+        .connect(source.to(destination).feedback(true))
+        .unwrap();
+
+    let inspection = graph.generate_inspection();
+    assert_eq!(inspection.feedback_edges.len(), 1);
+
+    let source_index = inspection
+        .nodes
+        .iter()
+        .position(|node| node.address == source)
+        .expect("source node should exist in inspection");
+    let destination_index = inspection
+        .nodes
+        .iter()
+        .position(|node| node.address == destination)
+        .expect("destination node should exist in inspection");
+
+    let edge = inspection.feedback_edges[0];
+    assert_eq!(edge.source, source_index);
+    assert_eq!(edge.destination, destination_index);
+    assert_eq!(edge.from_index, 0);
+    assert_eq!(edge.to_index, 0);
+}
+
+#[test]
+fn observability_snapshot_is_available_on_running_graph() {
+    let mut graph: Graph = Graph::new(GraphSettings {
+        block_size: 4096,
+        sample_rate: 44_100.0,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let node = graph.push(DummyGen { counter: 0.0 });
+    graph.connect(Connection::graph_output(node)).unwrap();
+
+    let mut run_graph = test_run_graph(&mut graph, RunGraphSettings::default());
+    run_graph.process_block();
+
+    let snapshot = graph
+        .observability_snapshot()
+        .expect("observability snapshot should be available for a running graph");
+    assert!(snapshot.load_ratio.is_finite());
+    assert!(snapshot.peak_load_ratio.is_finite());
+    assert!(snapshot.peak_load_ratio >= snapshot.load_ratio);
+}
+
+#[test]
+fn observability_dropout_count_can_be_incremented() {
+    let mut graph: Graph = Graph::new(GraphSettings {
+        block_size: 512,
+        sample_rate: 44_100.0,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let node = graph.push(DummyGen { counter: 0.0 });
+    graph.connect(Connection::graph_output(node)).unwrap();
+
+    let mut run_graph = test_run_graph(&mut graph, RunGraphSettings::default());
+    run_graph.process_block();
+
+    graph.increment_dropout_count(3);
+    let snapshot = graph
+        .observability_snapshot()
+        .expect("observability snapshot should be available for a running graph");
+    assert_eq!(snapshot.dropout_count, 3);
+}
+
+#[test]
 fn changing_the_graph() {
     const BLOCK: usize = 1;
     let mut graph: Graph = Graph::new(GraphSettings {

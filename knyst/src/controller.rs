@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     buffer::Buffer,
-    graph::{NodeChanges, ScheduleError, Time, TransportSnapshot},
+    graph::{NodeChanges, ObservabilitySnapshot, ScheduleError, Time, TransportSnapshot},
     inspection::GraphInspection,
     knyst_commands,
     resources::{BufferId, ResourcesCommand, ResourcesResponse, WavetableId},
@@ -61,10 +61,12 @@ enum Command {
     ScheduleBeatCallback(BeatCallback, StartBeat),
     RequestInspection(std::sync::mpsc::SyncSender<GraphInspection>),
     RequestTransportSnapshot(std::sync::mpsc::SyncSender<Option<TransportSnapshot>>),
+    RequestObservabilitySnapshot(std::sync::mpsc::SyncSender<Option<ObservabilitySnapshot>>),
     TransportPlay,
     TransportPause,
     TransportSeekSeconds(Seconds),
     TransportSeekBeats(Beats),
+    ReportDropouts(u64),
     ReportError(KnystError),
 }
 impl std::fmt::Debug for Command {
@@ -104,6 +106,10 @@ impl std::fmt::Debug for Command {
                 .debug_tuple("RequestTransportSnapshot")
                 .field(arg0)
                 .finish(),
+            Self::RequestObservabilitySnapshot(arg0) => f
+                .debug_tuple("RequestObservabilitySnapshot")
+                .field(arg0)
+                .finish(),
             Self::TransportPlay => write!(f, "TransportPlay"),
             Self::TransportPause => write!(f, "TransportPause"),
             Self::TransportSeekSeconds(arg0) => {
@@ -112,6 +118,7 @@ impl std::fmt::Debug for Command {
             Self::TransportSeekBeats(arg0) => {
                 f.debug_tuple("TransportSeekBeats").field(arg0).finish()
             }
+            Self::ReportDropouts(arg0) => f.debug_tuple("ReportDropouts").field(arg0).finish(),
             Self::ReportError(arg0) => f.debug_tuple("ReportError").field(arg0).finish(),
             Command::SetMortality { node, is_mortal } => f
                 .debug_tuple("SetMortality")
@@ -134,6 +141,9 @@ pub enum ControllerError {
     /// Sending a transport snapshot response failed because the receiver dropped.
     #[error("Failed to send transport snapshot response because the receiver was dropped.")]
     TransportSnapshotResponseChannelClosed,
+    /// Sending an observability snapshot response failed because the receiver dropped.
+    #[error("Failed to send observability snapshot response because the receiver was dropped.")]
+    ObservabilitySnapshotResponseChannelClosed,
 }
 
 /// [`KnystCommands`] sends commands to the [`Controller`] which should hold the
@@ -233,6 +243,10 @@ pub trait KnystCommands {
     fn request_transport_snapshot(
         &mut self,
     ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>>;
+    /// Request current runtime observability metrics.
+    fn request_observability_snapshot(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>>;
 
     /// Return the [`GraphSettings`] of the top level graph. This means you
     /// don't have to manually keep track of matching sample rate and block size
@@ -310,6 +324,11 @@ impl MultiThreadedKnystCommands {
     /// Best-effort error reporting to the controller error handler.
     pub(crate) fn report_error(&self, error: impl Into<KnystError>) {
         let _ = self.send_command(Command::ReportError(error.into()));
+    }
+
+    /// Best-effort reporting of backend dropouts/xruns.
+    pub(crate) fn report_dropouts(&self, count: u64) {
+        let _ = self.send_command(Command::ReportDropouts(count));
     }
 }
 
@@ -719,6 +738,16 @@ impl KnystCommands for MultiThreadedKnystCommands {
         receiver
     }
 
+    fn request_observability_snapshot(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        if let Err(error) = self.send_command(Command::RequestObservabilitySnapshot(sender)) {
+            self.report_error(error);
+        }
+        receiver
+    }
+
     fn to_graph(&mut self, graph_id: GraphId) {
         self.selected_graph_remote_graph = graph_id;
     }
@@ -1063,6 +1092,9 @@ impl Controller {
             Command::RequestTransportSnapshot(sender) => sender
                 .send(self.top_level_graph.transport_snapshot())
                 .map_err(|_| ControllerError::TransportSnapshotResponseChannelClosed.into()),
+            Command::RequestObservabilitySnapshot(sender) => sender
+                .send(self.top_level_graph.observability_snapshot())
+                .map_err(|_| ControllerError::ObservabilitySnapshotResponseChannelClosed.into()),
             Command::TransportPlay => self.top_level_graph.transport_play().map_err(From::from),
             Command::TransportPause => self.top_level_graph.transport_pause().map_err(From::from),
             Command::TransportSeekSeconds(position) => self
@@ -1073,6 +1105,10 @@ impl Controller {
                 .top_level_graph
                 .transport_seek_to_beats(position)
                 .map_err(From::from),
+            Command::ReportDropouts(count) => {
+                self.top_level_graph.increment_dropout_count(count);
+                Ok(())
+            }
             Command::ReportError(error) => Err(error),
             Command::SetMortality { node, is_mortal } => self
                 .top_level_graph
@@ -1465,6 +1501,40 @@ mod tests {
     }
 
     #[test]
+    fn request_observability_snapshot_reports_dropped_receiver() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+
+        controller.apply_command(Command::RequestObservabilitySnapshot(sender));
+
+        let errors = errors
+            .lock()
+            .expect("test error sink lock should not be poisoned");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            KnystError::ControllerError(
+                ControllerError::ObservabilitySnapshotResponseChannelClosed
+            )
+        ));
+    }
+
+    #[test]
+    fn request_observability_snapshot_returns_none_without_running_scheduler() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+        controller.apply_command(Command::RequestObservabilitySnapshot(sender));
+        let snapshot = receiver
+            .recv()
+            .expect("observability snapshot response should be sent");
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
     fn report_error_command_forwards_to_error_handler() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
@@ -1500,6 +1570,7 @@ mod tests {
             commands.transport_seek_to_seconds(Seconds::ZERO);
             commands.transport_seek_to_beats(Beats::ZERO);
             let _ = commands.request_transport_snapshot();
+            let _ = commands.request_observability_snapshot();
         }));
 
         assert!(result.is_ok());
