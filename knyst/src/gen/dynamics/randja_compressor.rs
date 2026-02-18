@@ -104,3 +104,9 @@ impl RandjaCompressor {
         GenState::Continue
     }
 }
+
+impl Default for RandjaCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}

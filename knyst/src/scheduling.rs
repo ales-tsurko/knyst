@@ -137,7 +137,7 @@ impl MusicalTimeMap {
     /// ```
     pub fn musical_time_to_secs_f64(&self, ts: Beats) -> f64 {
         // If we have not upheld our promise about the state of the MusicalTimeMap there is a bug
-        assert!(self.tempo_changes.len() > 0);
+        assert!(!self.tempo_changes.is_empty());
         assert_eq!(self.tempo_changes[0].1, Beats::new(0, 0));
         let mut accumulated_seconds: f64 = 0.0;
         let mut duration_remaining = ts;
@@ -179,7 +179,7 @@ impl MusicalTimeMap {
     /// Convert a timestamp in seconds to beats using self
     pub fn seconds_to_beats(&self, ts: Seconds) -> Beats {
         // If we have not upheld our promise about the state of the MusicalTimeMap there is a bug
-        assert!(self.tempo_changes.len() > 0);
+        assert!(!self.tempo_changes.is_empty());
         assert_eq!(self.tempo_changes[0].1, Beats::ZERO);
         let mut accumulated_beats = Beats::ZERO;
         let mut duration_remaining = ts.to_seconds_f64();
@@ -222,6 +222,11 @@ impl MusicalTimeMap {
     /// Returns the number of tempo changes
     pub fn len(&self) -> usize {
         self.tempo_changes.len()
+    }
+
+    /// Returns true if there are no tempo changes.
+    pub fn is_empty(&self) -> bool {
+        self.tempo_changes.is_empty()
     }
     /// Returns true if the tempo changes are in order, false if not. For testing purposes.
     pub fn is_sorted(&self) -> bool {

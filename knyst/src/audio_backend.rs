@@ -299,7 +299,7 @@ mod jack_backend {
                         // out_port_slice.clone_from_slice(out_buffer);
                         for (to_jack, graph_out) in out_port_slice.iter_mut().zip(out_buffer.iter())
                         {
-                            *to_jack = *graph_out as f32;
+                            *to_jack = *graph_out;
                         }
                     }
                     jack::Control::Continue

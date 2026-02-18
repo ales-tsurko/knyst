@@ -104,6 +104,20 @@ impl<
     //     fstringhz.atan2(fcutoffhz) * T::from_f32(-1.).unwrap()
     // }
 }
+
+impl<
+        T: num_traits::Float
+            + num_traits::FromPrimitive
+            + num_traits::FloatConst
+            + num_traits::One
+            + num_traits::Zero
+            + std::fmt::Display,
+    > Default for OnePole<T>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
 /// One pole lowpass filter Gen
 pub struct OnePoleLpf {
     /// The interval one pole filter implementation
@@ -137,6 +151,12 @@ impl OnePoleLpf {
             *o = self.op.process_lp(i as f64) as Sample;
         }
         GenState::Continue
+    }
+}
+
+impl Default for OnePoleLpf {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -174,5 +194,11 @@ impl OnePoleHpf {
             *o = self.op.process_hp(i as f64) as Sample;
         }
         GenState::Continue
+    }
+}
+
+impl Default for OnePoleHpf {
+    fn default() -> Self {
+        Self::new()
     }
 }

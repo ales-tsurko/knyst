@@ -58,6 +58,12 @@ impl OnceTrig {
     }
 }
 
+impl Default for OnceTrig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Send a trigger at a constant interval.
 /// *inputs*
 /// 0. "interval": The interval at which the trigger is being sent in seconds.
@@ -108,6 +114,12 @@ impl IntervalTrig {
     }
 }
 
+impl Default for IntervalTrig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -121,7 +133,7 @@ mod tests {
     #[test]
     fn regular_interval_trig() {
         const SR: u64 = 44100;
-        const BLOCK_SIZE: usize = 128 as usize;
+        const BLOCK_SIZE: usize = 128_usize;
         let graph_settings = GraphSettings {
             block_size: BLOCK_SIZE,
             sample_rate: SR as Sample,

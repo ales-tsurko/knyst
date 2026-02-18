@@ -760,6 +760,8 @@ pub enum StartBeat {
     Multiple(Beats),
 }
 
+type BeatCallbackFn = dyn FnMut(Beats, &mut MultiThreadedKnystCommands) -> Option<Beats> + Send;
+
 /// Callback that is scheduled in [`Beats`]. The closure inside the
 /// callback should only schedule changes in Beats time guided by the value
 /// to start scheduling that is passed to the function.
@@ -771,7 +773,7 @@ pub enum StartBeat {
 /// can return the time to wait until it gets called again or `None` to remove
 /// the callback.
 pub struct BeatCallback {
-    callback: Box<dyn FnMut(Beats, &mut MultiThreadedKnystCommands) -> Option<Beats> + Send>,
+    callback: Box<BeatCallbackFn>,
     next_timestamp: Beats,
     free_flag: Arc<AtomicBool>,
 }
@@ -933,11 +935,11 @@ impl Controller {
             Command::ScheduleChange(change) => self
                 .top_level_graph
                 .schedule_change(change)
-                .map_err(|e| From::from(e)),
+                .map_err(From::from),
             Command::FreeDisconnectedNodes => self
                 .top_level_graph
                 .free_disconnected_nodes()
-                .map_err(|e| From::from(e)),
+                .map_err(From::from),
             Command::ResourcesCommand(resources_command) => {
                 // Try sending it to Resources. If it fails, store it in the queue.
                 match self.resources_sender.push(resources_command) {
@@ -956,7 +958,7 @@ impl Controller {
             Command::ChangeMusicalTimeMap(change_fn) => self
                 .top_level_graph
                 .change_musical_time_map(change_fn)
-                .map_err(|e| From::from(e)),
+                .map_err(From::from),
             Command::ScheduleChanges(changes) => {
                 let changes_clone = changes.clone();
                 match self
@@ -1000,7 +1002,7 @@ impl Controller {
             Command::SetMortality { node, is_mortal } => self
                 .top_level_graph
                 .set_node_mortality(node, is_mortal)
-                .map_err(|e| From::from(e)),
+                .map_err(From::from),
         };
 
         if let Err(e) = result {

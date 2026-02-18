@@ -176,7 +176,7 @@ impl Drop for RunGraph {
         // made.
         if !self.input_buffer_ptr.is_null() {
             unsafe {
-                drop(Box::from_raw(std::slice::from_raw_parts_mut(
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                     self.input_buffer_ptr,
                     self.input_buffer_length,
                 )));

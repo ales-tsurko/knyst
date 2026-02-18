@@ -75,3 +75,9 @@ impl RandomLin {
         GenState::Continue
     }
 }
+
+impl Default for RandomLin {
+    fn default() -> Self {
+        Self::new()
+    }
+}

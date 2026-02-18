@@ -181,9 +181,8 @@ impl BufferReader {
         let mut stop_sample = None;
         if !self.finished {
             if let IdOrKey::Id(id) = self.buffer_key {
-                match resources.buffer_key_from_id(id) {
-                    Some(key) => self.buffer_key = IdOrKey::Key(key),
-                    None => (),
+                if let Some(key) = resources.buffer_key_from_id(id) {
+                    self.buffer_key = IdOrKey::Key(key)
                 }
             }
             if let IdOrKey::Key(buffer_key) = self.buffer_key {
@@ -305,9 +304,8 @@ impl Gen for BufferReaderMulti {
         let mut stop_sample = None;
         if !self.finished {
             if let IdOrKey::Id(id) = self.buffer_key {
-                match resources.buffer_key_from_id(id) {
-                    Some(key) => self.buffer_key = IdOrKey::Key(key),
-                    None => (),
+                if let Some(key) = resources.buffer_key_from_id(id) {
+                    self.buffer_key = IdOrKey::Key(key)
                 }
             }
             if let IdOrKey::Key(buffer_key) = self.buffer_key {

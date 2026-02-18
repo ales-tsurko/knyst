@@ -245,6 +245,12 @@ impl SvfHighShelf {
     }
 }
 
+impl Default for SvfHighShelf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Svf filter with controllable settings.
 ///
 /// Uses the [`SvfFilter`] under the hood, but allows for setting the filter parameters at block rate

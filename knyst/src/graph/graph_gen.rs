@@ -1,39 +1,56 @@
-use std::{
-    cell::UnsafeCell,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
 use rtrb::Producer;
-use slotmap::SlotMap;
 
 use crate::{internal_filter::hiir::StandardDownsampler2X, Resources};
 
 use super::{
     node::Node, Gen, GenContext, GenState, NodeBufferRef, NodeId, NodeKey, Oversampling,
-    OwnedRawBuffer, Sample, ScheduleReceiver, TaskData,
+    OwnedRawBuffer, Sample, ScheduleReceiver, SharedNodeStorage, TaskData,
 };
 
-pub(super) fn make_graph_gen(
-    sample_rate: Sample,
-    parent_sample_rate: Sample,
-    current_task_data: TaskData,
-    block_size: usize,
-    parent_block_size: usize,
-    oversampling: Oversampling,
-    parent_oversampling: Oversampling,
-    num_outputs: usize,
-    num_inputs: usize,
-    timestamp: Arc<AtomicU64>,
-    free_node_queue_producer: Producer<(NodeKey, GenState)>,
-    schedule_receiver: ScheduleReceiver,
-    arc_nodes: Arc<UnsafeCell<SlotMap<NodeKey, Node>>>,
-    task_data_to_be_dropped_producer: rtrb::Producer<TaskData>,
-    new_task_data_consumer: rtrb::Consumer<TaskData>,
-    arc_inputs_buffers_ptr: Arc<OwnedRawBuffer>,
-) -> Box<dyn Gen + Send> {
+pub(super) struct GraphGenBuildArgs {
+    pub sample_rate: Sample,
+    pub parent_sample_rate: Sample,
+    pub current_task_data: TaskData,
+    pub block_size: usize,
+    pub parent_block_size: usize,
+    pub oversampling: Oversampling,
+    pub parent_oversampling: Oversampling,
+    pub num_outputs: usize,
+    pub num_inputs: usize,
+    pub timestamp: Arc<AtomicU64>,
+    pub free_node_queue_producer: Producer<(NodeKey, GenState)>,
+    pub schedule_receiver: ScheduleReceiver,
+    pub arc_nodes: Arc<SharedNodeStorage>,
+    pub task_data_to_be_dropped_producer: rtrb::Producer<TaskData>,
+    pub new_task_data_consumer: rtrb::Consumer<TaskData>,
+    pub arc_inputs_buffers_ptr: Arc<OwnedRawBuffer>,
+}
+
+pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
+    let GraphGenBuildArgs {
+        sample_rate,
+        parent_sample_rate,
+        current_task_data,
+        block_size,
+        parent_block_size,
+        oversampling,
+        parent_oversampling,
+        num_outputs,
+        num_inputs,
+        timestamp,
+        free_node_queue_producer,
+        schedule_receiver,
+        arc_nodes,
+        task_data_to_be_dropped_producer,
+        new_task_data_consumer,
+        arc_inputs_buffers_ptr,
+    } = args;
+
     let graph_gen = Box::new(GraphGen {
         sample_rate: sample_rate * oversampling.as_usize() as Sample,
         current_task_data,
@@ -129,13 +146,9 @@ enum BlockConverterSpecies {
 impl GraphBlockConverterGen {
     pub fn new(graph_gen_node: Node, parent_block_size: usize, inner_block_size: usize) -> Self {
         let species = if parent_block_size > inner_block_size {
-            let inputs_buffers_ptr = Box::<[Sample]>::into_raw(
-                vec![0.0 as Sample; inner_block_size * graph_gen_node.num_inputs()]
-                    .into_boxed_slice(),
-            );
-            let inputs_buffers_ptr = Arc::new(OwnedRawBuffer {
-                ptr: inputs_buffers_ptr,
-            });
+            let inputs_buffers_ptr = Arc::new(OwnedRawBuffer::new(
+                inner_block_size * graph_gen_node.num_inputs(),
+            ));
             BlockConverterSpecies::InnerSmallOuterLarge {
                 num_batches: parent_block_size / inner_block_size,
                 inputs_buffers_ptr,
@@ -173,9 +186,8 @@ impl GraphBlockConverterGen {
         let offset = *batch_counter * parent_block_size;
         let mut node_outputs = graph_gen_node.output_buffers();
         for (output_channel, node_output) in ctx.outputs.iter_mut().zip(node_outputs.iter_mut()) {
-            for sample in 0..parent_block_size {
-                output_channel[sample] = node_output[sample + offset];
-            }
+            output_channel[..parent_block_size]
+                .copy_from_slice(&node_output[offset..(parent_block_size + offset)]);
         }
         *batch_counter += 1;
     }
@@ -204,7 +216,7 @@ impl GraphBlockConverterGen {
             // use the sample rate from upstream
             let returned_gen_state =
                 self.graph_gen_node
-                    .process(&input_buffers, ctx.sample_rate, resources);
+                    .process(input_buffers, ctx.sample_rate, resources);
             // Copy the outputs of the node to the outputs of this Gen
             for output_num in 0..ctx.outputs.channels() {
                 for sample in 0..self.inner_block_size {
@@ -248,7 +260,7 @@ impl Gen for GraphBlockConverterGen {
                 num_batches,
                 inputs_buffers_ptr,
             } => {
-                let input_buffers_first_sample = inputs_buffers_ptr.ptr.cast::<Sample>();
+                let input_buffers_first_sample = inputs_buffers_ptr.first_sample_ptr();
                 let mut input_buffers = NodeBufferRef::new(
                     input_buffers_first_sample,
                     self.graph_gen_node.num_inputs(),
@@ -525,7 +537,7 @@ pub(super) struct GraphGen {
     num_inputs: usize,
     current_task_data: TaskData,
     // This Arc is cloned from the Graph and exists so that if the Graph gets dropped, the GraphGen can continue on without segfaulting.
-    _arc_nodes: Arc<UnsafeCell<SlotMap<NodeKey, Node>>>,
+    _arc_nodes: Arc<SharedNodeStorage>,
     // This Arc makes sure the input buffers allocation is valid for as long as it needs to be
     _arc_inputs_buffers_ptr: Arc<OwnedRawBuffer>,
     graph_state: GenState,

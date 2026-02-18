@@ -25,11 +25,11 @@ pub trait Gen {
     /// The input and output buffers are both indexed using \[in/out_index\]\[sample_index\].
     ///
     /// - *inputs*: The inputs to the Gen filled with the relevant values. May be any size the same or larger
-    /// than the number of inputs to this particular Gen.
+    ///   than the number of inputs to this particular Gen.
     ///
     /// - *outputs*: The buffer to place the result of the Gen inside. This buffer may contain any data and
-    /// will not be zeroed. If the output should be zero, the Gen needs to write zeroes into the output
-    /// buffer. This buffer will be correctly sized to hold the number of outputs that the Gen requires.
+    ///   will not be zeroed. If the output should be zero, the Gen needs to write zeroes into the output
+    ///   buffer. This buffer will be correctly sized to hold the number of outputs that the Gen requires.
     fn process(&mut self, ctx: GenContext, resources: &mut Resources) -> GenState;
     /// The number of inputs this `Gen` takes. Determines how big the input buffer is.
     fn num_inputs(&self) -> usize;

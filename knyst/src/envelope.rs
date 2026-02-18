@@ -110,9 +110,7 @@ impl Curve {
         match self {
             Curve::Linear => a,
             // Using the fastapprox::faster variant is significantly faster, but too inaccurate
-            Curve::Exponential(exponent) => {
-                fastapprox::fast::pow(a as f32, *exponent as f32) as Sample
-            }
+            Curve::Exponential(exponent) => fastapprox::fast::pow(a, *exponent) as Sample,
         }
     }
 }

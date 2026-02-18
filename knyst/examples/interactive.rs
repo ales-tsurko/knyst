@@ -101,7 +101,7 @@ fn main() -> Result<()> {
 
     // Have a background thread play some harmony
     {
-        let chords = vec![
+        let chords = [
             vec![0, 17, 31],
             vec![53, 17, 31],
             vec![0, 22, 36],
@@ -172,7 +172,7 @@ fn main() -> Result<()> {
         delay_node: None,
         harmony_wavetable_id,
         tokio_trigger,
-        lead_env: env.into(),
+        lead_env: env,
         error_strings: vec![],
         error_receiver,
         invalid_node: invalid_node.into(),
@@ -435,7 +435,7 @@ async fn play_a_little_tune(speed: Sample) {
     for (degree_53, beats) in melody {
         let freq = degree_53_to_hz(degree_53 as Sample + 53., ROOT_FREQ);
         spawn_note(freq, beats * speed).await;
-        tokio::time::sleep(tokio::time::Duration::from_secs_f32((beats * speed) as f32)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs_f32(beats * speed)).await;
     }
 }
 

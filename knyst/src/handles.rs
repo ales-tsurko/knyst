@@ -71,12 +71,12 @@ impl<H: Copy> Deref for Handle<H> {
         &self.handle
     }
 }
-impl Into<GenericHandle> for GraphHandle {
-    fn into(self) -> GenericHandle {
+impl From<GraphHandle> for GenericHandle {
+    fn from(val: GraphHandle) -> Self {
         GenericHandle {
-            node_id: self.node_id,
-            num_inputs: self.num_inputs,
-            num_outputs: self.num_outputs,
+            node_id: val.node_id,
+            num_inputs: val.num_inputs,
+            num_outputs: val.num_outputs,
         }
     }
 }
@@ -189,7 +189,7 @@ impl<A: Copy + HandleData> Handle<A> {
         // TODO: better way to send a trigger
         let mut changes = SimultaneousChanges::now();
         for id in self.node_ids() {
-            changes.push(id.change().trigger(channel.clone()));
+            changes.push(id.change().trigger(channel));
         }
         knyst_commands().schedule_changes(changes);
         self
@@ -315,7 +315,7 @@ impl<H: Copy + HandleData> HandleData for RepeatOutputs<H> {
         let channels = self
             .handle
             .out_channels()
-            .flat_map(|item| std::iter::repeat(item).take(self.repeats + 1))
+            .flat_map(|item| std::iter::repeat_n(item, self.repeats + 1))
             .collect();
         SourceChannelIter::from_vec(channels)
     }
@@ -1335,7 +1335,7 @@ impl AnyNodeHandle {
         // TODO: better way to send a trigger
         let mut changes = SimultaneousChanges::now();
         for id in self.node_ids() {
-            changes.push(id.change().trigger(channel.clone()));
+            changes.push(id.change().trigger(channel));
         }
         knyst_commands().schedule_changes(changes);
         self

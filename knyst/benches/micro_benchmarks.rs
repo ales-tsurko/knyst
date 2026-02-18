@@ -10,7 +10,7 @@ pub fn phase_float_or_uint(c: &mut Criterion) {
     let sample_rate = 44100.0;
 
     let freq_to_phase_inc =
-        (TABLE_SIZE as f64 * FRACTIONAL_PART as f64 * (1.0 / sample_rate as f64)) as Sample;
+        (TABLE_SIZE as f64 * FRACTIONAL_PART as f64 * (1.0 / sample_rate)) as Sample;
     let freq_to_f32_phase_inc = 1.0 / sample_rate as f32;
     let freq = 824.3;
     let table: Vec<f32> = (0..TABLE_SIZE)

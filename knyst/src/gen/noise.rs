@@ -26,6 +26,12 @@ impl WhiteNoise {
         GenState::Continue
     }
 }
+
+impl Default for WhiteNoise {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 const PINK_NOISE_OCTAVES: u32 = 9;
 /// Pink noise
 ///
@@ -68,8 +74,8 @@ impl PinkNoise {
         assert!(self.counter > 0);
         assert!(self.counter <= self.mask);
 
-        self.counter = self.counter & (self.mask - 1);
-        self.counter = self.counter + 1;
+        self.counter &= self.mask - 1;
+        self.counter += 1;
     }
 
     #[allow(missing_docs)]
@@ -77,13 +83,13 @@ impl PinkNoise {
         let index = self.noise_index() as usize;
         assert!(index < PINK_NOISE_OCTAVES as usize);
 
-        self.pink = self.pink - self.white_noises[index];
+        self.pink -= self.white_noises[index];
         self.white_noises[index] = self.rng.f32() as Sample * 2.0 - 1.0;
-        self.pink = self.pink + self.white_noises[index];
+        self.pink += self.white_noises[index];
 
-        self.pink = self.pink - self.always_on_white_noise;
+        self.pink -= self.always_on_white_noise;
         self.always_on_white_noise = self.rng.f32() as Sample * 2.0 - 1.0;
-        self.pink = self.pink + self.always_on_white_noise;
+        self.pink += self.always_on_white_noise;
 
         self.increment_counter();
 
@@ -96,6 +102,12 @@ impl PinkNoise {
             *out = self.process_sample();
         }
         GenState::Continue
+    }
+}
+
+impl Default for PinkNoise {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -132,5 +144,11 @@ impl BrownNoise {
             *out = self.last_output;
         }
         GenState::Continue
+    }
+}
+
+impl Default for BrownNoise {
+    fn default() -> Self {
+        Self::new()
     }
 }

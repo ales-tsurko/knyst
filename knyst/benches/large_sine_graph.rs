@@ -9,7 +9,7 @@ pub fn empty_graph(c: &mut Criterion) {
         ..Default::default()
     };
     let mut graph = Graph::new(graph_settings);
-    let resources = Resources::new(ResourcesSettings::default());
+    let resources = Resources::new(ResourcesSettings::default()).unwrap();
     let (mut run_graph, _, _) =
         RunGraph::new(&mut graph, resources, RunGraphSettings::default()).unwrap();
     c.bench_function("0 nodes, block size 64, sr 44100", |b| {
@@ -32,7 +32,7 @@ pub fn large_sine_graph(c: &mut Criterion) {
         graph.connect(sine.to_graph_out()).unwrap();
     }
     graph.update();
-    let resources = Resources::new(ResourcesSettings::default());
+    let resources = Resources::new(ResourcesSettings::default()).unwrap();
     let (mut run_graph, _, _) =
         RunGraph::new(&mut graph, resources, RunGraphSettings::default()).unwrap();
     c.bench_function("1000 nodes, block size 64, sr 44100", |b| {
@@ -53,7 +53,7 @@ pub fn large_sine_graph(c: &mut Criterion) {
         graph.connect(sine.to_graph_out()).unwrap();
     }
     graph.update();
-    let resources = Resources::new(ResourcesSettings::default());
+    let resources = Resources::new(ResourcesSettings::default()).unwrap();
     let (mut run_graph, _, _) =
         RunGraph::new(&mut graph, resources, RunGraphSettings::default()).unwrap();
     c.bench_function("1000 nodes, block size 16, sr 44100", |b| {
@@ -74,7 +74,7 @@ pub fn large_sine_graph(c: &mut Criterion) {
         graph.connect(sine.to_graph_out()).unwrap();
     }
     graph.update();
-    let resources = Resources::new(ResourcesSettings::default());
+    let resources = Resources::new(ResourcesSettings::default()).unwrap();
     let (mut run_graph, _, _) =
         RunGraph::new(&mut graph, resources, RunGraphSettings::default()).unwrap();
     c.bench_function("1000 nodes, block size 512, sr 44100", |b| {
@@ -97,7 +97,7 @@ fn create_pyramid_graph(power_of_two: usize, mut graph_settings: GraphSettings) 
         for j in 0..num_nodes {
             let gen = WavetableOscillatorOwned::new(Wavetable::sine());
             let node_id = graph.push(gen);
-            if last_layer_node_ids.len() == 0 {
+            if last_layer_node_ids.is_empty() {
                 graph.connect(node_id.to_graph_out()).unwrap();
             } else {
                 let index = j / 2;
@@ -120,7 +120,7 @@ pub fn large_complex_sine_graph(c: &mut Criterion) {
     };
     let mut graph = create_pyramid_graph(10, graph_settings);
     graph.update();
-    let resources = Resources::new(ResourcesSettings::default());
+    let resources = Resources::new(ResourcesSettings::default()).unwrap();
     let (mut run_graph, _, _) =
         RunGraph::new(&mut graph, resources, RunGraphSettings::default()).unwrap();
     c.bench_function(

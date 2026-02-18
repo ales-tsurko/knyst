@@ -294,7 +294,7 @@ fn remove_nodes() {
         } else {
             graph.connect(Connection::graph_output(node)).unwrap();
         }
-        last_node = Some(node.clone());
+        last_node = Some(node);
         nodes.push(node);
     }
     graph.update();
@@ -348,7 +348,7 @@ fn parallel_mutation() {
         } else {
             graph.connect(Connection::graph_output(node)).unwrap();
         }
-        last_node = Some(node.clone());
+        last_node = Some(node);
         nodes.push(node);
         graph.update();
         std::thread::sleep(std::time::Duration::from_millis(3));
@@ -367,7 +367,7 @@ fn parallel_mutation() {
         } else {
             graph.connect(Connection::graph_output(node)).unwrap();
         }
-        last_node = Some(node.clone());
+        last_node = Some(node);
         nodes.push(node);
         graph.update();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -831,7 +831,7 @@ fn start_nodes_with_sample_precision() {
     let n1 = graph.push_at_time(
         gen(move |ctx, _resources| {
             for i in 0..ctx.outputs.block_size() {
-                ctx.outputs.write(counter1 * -1. - 1., 0, i);
+                ctx.outputs.write(-counter1 - 1., 0, i);
                 counter1 += 1.0;
             }
             GenState::Continue
@@ -863,7 +863,7 @@ fn start_nodes_with_sample_precision() {
     let n3 = graph.push_at_time(
         gen(move |ctx, _resources| {
             for i in 0..ctx.outputs.block_size() {
-                ctx.outputs.write(counter3 * -1. - 1., 0, i);
+                ctx.outputs.write(-counter3 - 1., 0, i);
                 counter3 += 1.0;
             }
             GenState::Continue
@@ -1023,7 +1023,7 @@ fn compare<T: PartialOrd>(a: &[T], b: &[T]) -> std::cmp::Ordering {
             ord => return ord.unwrap(),
         }
     }
-    return a.len().cmp(&b.len());
+    a.len().cmp(&b.len())
 }
 
 #[test]
@@ -1137,7 +1137,7 @@ fn stereo_timing() {
 
     let out_left = kt.output_channel(0).unwrap();
     let out_right = kt.output_channel(1).unwrap();
-    for (&l, &r) in out_left.into_iter().zip(out_right) {
+    for (&l, &r) in out_left.iter().zip(out_right) {
         assert!(l == r - 10.);
     }
 }
@@ -1157,7 +1157,7 @@ fn stereo_timing_mult() {
 
     let out_left = kt.output_channel(0).unwrap();
     let out_right = kt.output_channel(1).unwrap();
-    for (&l, &r) in out_left.into_iter().zip(out_right) {
+    for (&l, &r) in out_left.iter().zip(out_right) {
         assert!(l == r - 5.);
     }
 }
@@ -1195,7 +1195,7 @@ fn stereo_timing_mult_inner_graph() {
 
     let out_left = ko.output_channel(0).unwrap();
     let out_right = ko.output_channel(1).unwrap();
-    for (&l, &r) in out_left.into_iter().zip(out_right) {
+    for (&l, &r) in out_left.iter().zip(out_right) {
         assert!(l == r - 200.);
     }
 }

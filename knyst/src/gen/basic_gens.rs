@@ -87,7 +87,7 @@ impl Gen for PowfGen {
             // #[cfg(not(feature = "unstable"))]
             {
                 for i in 0..block_size {
-                    out[i] = fastapprox::fast::pow(value[i] as f32, exponent[i] as f32) as Sample;
+                    out[i] = fastapprox::fast::pow(value[i], exponent[i]) as Sample;
                 }
             }
             // #[cfg(feature = "unstable")]
@@ -284,7 +284,7 @@ impl Gen for Bus {
 /// *inputs*
 /// 0. "min": The output min value
 /// 1. "max": The output max value
-/// 2..N: The input channels
+///    2..N: The input channels
 pub struct RangeGen(pub usize);
 impl Gen for RangeGen {
     fn process(&mut self, ctx: GenContext, _resources: &mut Resources) -> GenState {
@@ -391,8 +391,8 @@ impl PanMonoToStereo {
             // The equation needs pan to be in the range [0, 1]
             let pan = pan[i] * 0.5 + 0.5;
             let pan_pos_radians = pan * std::f64::consts::FRAC_PI_2 as Sample;
-            let left_gain = fastapprox::fast::cos(pan_pos_radians as f32) as Sample;
-            let right_gain = fastapprox::fast::sin(pan_pos_radians as f32) as Sample;
+            let left_gain = fastapprox::fast::cos(pan_pos_radians) as Sample;
+            let right_gain = fastapprox::fast::sin(pan_pos_radians) as Sample;
             left[i] = signal * left_gain;
             right[i] = signal * right_gain;
         }
@@ -524,13 +524,13 @@ mod tests {
         graph_output(0, line_segment(1.0, 2.0, Seconds::from_seconds_f64(1.0)));
         kt.process_block();
         let output = kt.output_channel(0).unwrap();
-        for i in 0..8 {
-            assert_eq!(output[i], 1.0 + (i as f32 / 8.));
+        for (i, sample) in output.iter().enumerate().take(8) {
+            assert_eq!(*sample, 1.0 + (i as f32 / 8.));
         }
         kt.process_block();
         let output = kt.output_channel(0).unwrap();
-        for i in 0..8 {
-            assert_eq!(output[i], 2.);
+        for sample in output.iter().take(8) {
+            assert_eq!(*sample, 2.);
         }
     }
     #[test]
@@ -544,7 +544,6 @@ mod tests {
         kt.process_block();
         let output = kt.output_channel(0).unwrap();
         assert_eq!(output[0], 1.0);
-        dbg!(output);
         let mut diff = output[1] - output[0];
         for i in 1..sr - 1 {
             let new_diff = output[i + 1] - output[0];
@@ -555,8 +554,8 @@ mod tests {
         assert!(output[sr - 1] < 2.0);
         kt.process_block();
         let output = kt.output_channel(0).unwrap();
-        for i in 0..32 {
-            assert_eq!(output[i], 2.);
+        for sample in output.iter().take(32) {
+            assert_eq!(*sample, 2.);
         }
     }
 }

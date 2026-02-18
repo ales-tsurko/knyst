@@ -81,12 +81,10 @@ fn main() -> Result<()> {
             i += 1;
             if time > Beats::from_beats(32) {
                 None
+            } else if i % 2 == 0 {
+                Some(Beats::from_beats(2))
             } else {
-                if i % 2 == 0 {
-                    Some(Beats::from_beats(2))
-                } else {
-                    Some(Beats::from_beats_f32(1.25))
-                }
+                Some(Beats::from_beats_f32(1.25))
             }
         },
         StartBeat::Multiple(Beats::from_beats(4)), // Start after a multiple of 4 beats

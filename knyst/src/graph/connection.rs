@@ -237,7 +237,7 @@ impl Connection {
     /// Create a connection from `source_node` to a graph output
     pub fn graph_output(source_node: NodeId) -> Self {
         Self::GraphOutput {
-            source: source_node.clone(),
+            source: source_node,
             from_index: Some(0),
             from_label: None,
             to_index: 0,
@@ -247,7 +247,7 @@ impl Connection {
     /// Create a connection from a graph_input to the `sink_node`
     pub fn graph_input(sink_node: NodeId) -> Self {
         Self::GraphInput {
-            sink: sink_node.clone(),
+            sink: sink_node,
             from_index: 0,
             to_index: None,
             to_label: None,
@@ -258,7 +258,7 @@ impl Connection {
     /// Clear input constants of `node`
     pub fn clear_constants(node: NodeId) -> Self {
         Self::Clear {
-            node: node.clone(),
+            node,
             input_constants: true,
             input_nodes: false,
             output_nodes: false,
@@ -270,7 +270,7 @@ impl Connection {
     /// Clear connections from other nodes to this `node`'s input(s)
     pub fn clear_from_nodes(node: NodeId) -> Self {
         Self::Clear {
-            node: node.clone(),
+            node,
             input_constants: false,
             input_nodes: true,
             output_nodes: false,
@@ -282,7 +282,7 @@ impl Connection {
     /// Clear connections from the `node` specified to other nodes
     pub fn clear_to_nodes(node: NodeId) -> Self {
         Self::Clear {
-            node: node.clone(),
+            node,
             input_constants: false,
             input_nodes: false,
             output_nodes: true,
@@ -294,7 +294,7 @@ impl Connection {
     /// Clear connections from the `node` to the graph outputs
     pub fn clear_to_graph_outputs(node: NodeId) -> Self {
         Self::Clear {
-            node: node.clone(),
+            node,
             input_constants: false,
             input_nodes: false,
             output_nodes: false,
@@ -306,7 +306,7 @@ impl Connection {
     /// Clear connections from the graph inputs to the `node`
     pub fn clear_from_graph_inputs(node: NodeId) -> Self {
         Self::Clear {
-            node: node.clone(),
+            node,
             input_constants: false,
             input_nodes: false,
             output_nodes: false,
@@ -325,7 +325,7 @@ impl Connection {
             Connection::GraphInput { .. } => {}
             Connection::Constant { .. } => {}
             Connection::GraphOutput { ref mut source, .. } => {
-                *source = source_node.clone();
+                *source = source_node;
             }
             Connection::Clear { .. } => {}
             Connection::GraphInputToOutput { .. } => {}
@@ -602,8 +602,8 @@ impl Connection {
     /// Get the source node address if one is set and the current variant has one.
     pub fn get_source_node(&self) -> Option<NodeId> {
         match self {
-            Connection::Node { source, .. } => Some(source.clone()),
-            Connection::GraphOutput { source, .. } => Some(source.clone()),
+            Connection::Node { source, .. } => Some(*source),
+            Connection::GraphOutput { source, .. } => Some(*source),
             Connection::GraphInput { .. }
             | Connection::Constant { .. }
             | Connection::Clear { .. }
@@ -703,10 +703,10 @@ impl NodeOutput {
     /// Create a connection from self to the specified node.
     pub fn to_node(&self, node: NodeId) -> Connection {
         let connection = Connection::Node {
-            source: self.from_node.clone(),
+            source: self.from_node,
             from_index: None,
             from_label: None,
-            sink: node.clone(),
+            sink: node,
             to_index: None,
             to_label: None,
             channels: 1,
@@ -721,7 +721,7 @@ impl NodeOutput {
     /// Create a connection from self to the graph output of the graph the node is in.
     pub fn to_graph_out(&self) -> Connection {
         let connection = Connection::GraphOutput {
-            source: self.from_node.clone(),
+            source: self.from_node,
             from_index: Some(0),
             from_label: None,
             to_index: 0,
@@ -815,7 +815,7 @@ impl InputBundle {
     /// Set the sink node to generate a [`ConnectionBundle`]
     pub fn to(self, node_address: NodeId) -> ConnectionBundle {
         ConnectionBundle {
-            to_node: node_address.clone(),
+            to_node: node_address,
             inputs: self.inputs,
         }
     }
@@ -838,6 +838,12 @@ impl InputBundle {
     pub fn extend(mut self, other: Self) -> Self {
         self.inputs.extend(other.inputs);
         self
+    }
+}
+
+impl Default for InputBundle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -892,8 +898,7 @@ impl From<Vec<InputBundle>> for InputBundle {
     fn from(vec_of_bundles: Vec<InputBundle>) -> Self {
         let inputs = vec_of_bundles
             .iter()
-            .map(|cb| cb.inputs.clone())
-            .flatten()
+            .flat_map(|cb| cb.inputs.clone())
             .collect();
         Self { inputs }
     }

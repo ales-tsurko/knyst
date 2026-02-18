@@ -15,7 +15,7 @@ use crate::Sample;
 /// *inputs*
 /// 0. "signal": input signal, the signal to be delayed
 /// 1. "delay_time": the delay time in seconds (will be truncated to the nearest sample)
-/// *outputs*
+///    *outputs*
 /// 0. "signal": the delayed signal
 pub struct SampleDelay {
     buffer: Vec<Sample>,
@@ -99,6 +99,12 @@ impl AllpassInterpolator {
     }
 }
 
+impl Default for AllpassInterpolator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Delay with allpass interpolation between adjacent samples, no feedback.
 #[derive(Clone, Debug)]
 pub struct AllpassDelay {
@@ -173,12 +179,12 @@ impl AllpassFeedbackDelay {
     #[must_use]
     pub fn new(max_delay_samples: usize) -> Self {
         let allpass_delay = AllpassDelay::new(max_delay_samples);
-        let s = Self {
+
+        Self {
             feedback: 0.,
             allpass_delay,
             previous_delay_time: max_delay_samples as Sample,
-        };
-        s
+        }
     }
     /// Set the delay length counted in frames/samples
     pub fn set_delay_in_frames(&mut self, delay_length: f64) {
@@ -320,7 +326,7 @@ impl StaticSampleDelay {
         assert!(self.buffer.len() >= block_size);
         let write_end = self.position + block_size;
         if write_end <= self.buffer.len() {
-            self.buffer[self.position..write_end].copy_from_slice(&input);
+            self.buffer[self.position..write_end].copy_from_slice(input);
         } else {
             // block wraps around
             let write_end = write_end % self.delay_length;

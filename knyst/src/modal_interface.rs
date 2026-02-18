@@ -348,9 +348,9 @@ static DEFAULT_KNYST_SPHERE: AtomicU16 = AtomicU16::new(0);
 static ALL_KNYST_SPHERES: Mutex<Vec<(KnystSphere, SphereId)>> = Mutex::new(vec![]);
 
 thread_local! {
-    static ACTIVE_KNYST_SPHERE: RefCell<SphereId> = RefCell::new(SphereId(0));
+    static ACTIVE_KNYST_SPHERE: RefCell<SphereId> = const { RefCell::new(SphereId(0)) };
     // The inner Rc<Refcell<>> cuts execution time to 1/3
-    static ACTIVE_KNYST_SPHERE_COMMANDS: RefCell<Option<Rc<RefCell<SelectedKnystCommands>>>> = RefCell::new(None);
+    static ACTIVE_KNYST_SPHERE_COMMANDS: RefCell<Option<Rc<RefCell<SelectedKnystCommands>>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn register_sphere(sphere: KnystSphere) -> Result<SphereId, SphereError> {

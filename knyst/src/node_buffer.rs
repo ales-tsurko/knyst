@@ -73,7 +73,7 @@ impl NodeBufferRef {
     /// mutable references to the same channel this way is, however, UB. Use
     /// `split_mut` for an iterator to all channels instead.
     #[inline]
-    pub unsafe fn get_channel_mut<'a, 'b>(&'a mut self, channel: usize) -> &'b mut [Sample] {
+    pub unsafe fn get_channel_mut<'b>(&mut self, channel: usize) -> &'b mut [Sample] {
         assert!(channel < self.num_channels);
         assert!(!self.buf.is_null());
         let channel_offset = channel * self.block_size;

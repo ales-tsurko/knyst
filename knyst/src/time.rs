@@ -77,7 +77,7 @@ impl Seconds {
     pub fn to_samples(&self, sample_rate: u64) -> u64 {
         self.seconds as u64 * sample_rate
             + ((self.subsample_tesimals as u64 * sample_rate)
-                / SUBSAMPLE_TESIMALS_PER_SECOND as u64) as u64
+                / SUBSAMPLE_TESIMALS_PER_SECOND as u64)
     }
 
     /// Returns self - other if self is bigger than or equal to other, otherwise None
@@ -271,19 +271,16 @@ impl Beats {
     pub fn checked_sub(&self, v: Self) -> Option<Self> {
         if self < &v {
             None
+        } else if self.beat_tesimals < v.beat_tesimals {
+            Some(Self {
+                beats: self.beats - v.beats - 1,
+                beat_tesimals: SUBBEAT_TESIMALS_PER_BEAT - (v.beat_tesimals - self.beat_tesimals),
+            })
         } else {
-            if self.beat_tesimals < v.beat_tesimals {
-                Some(Self {
-                    beats: self.beats - v.beats - 1,
-                    beat_tesimals: SUBBEAT_TESIMALS_PER_BEAT
-                        - (v.beat_tesimals - self.beat_tesimals),
-                })
-            } else {
-                Some(Self {
-                    beats: self.beats - v.beats,
-                    beat_tesimals: self.beat_tesimals - v.beat_tesimals,
-                })
-            }
+            Some(Self {
+                beats: self.beats - v.beats,
+                beat_tesimals: self.beat_tesimals - v.beat_tesimals,
+            })
         }
     }
 }
