@@ -275,7 +275,7 @@ impl MultiThreadedKnystCommands {
     }
 
     /// Best-effort error reporting to the controller error handler.
-    fn report_error(&self, error: impl Into<KnystError>) {
+    pub(crate) fn report_error(&self, error: impl Into<KnystError>) {
         let _ = self.send_command(Command::ReportError(error.into()));
     }
 }

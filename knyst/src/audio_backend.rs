@@ -129,6 +129,14 @@ pub enum AudioBackendError {
     #[cfg(feature = "cpal")]
     #[error("Unsupported CPAL sample format: {0:?}")]
     UnsupportedSampleFormat(cpal::SampleFormat),
+    #[cfg(feature = "cpal")]
+    #[error(
+        "CPAL input overflow: dropped {dropped_samples} sample(s) because the input queue was full."
+    )]
+    CpalInputOverflow { dropped_samples: usize },
+    #[cfg(feature = "cpal")]
+    #[error("CPAL input underflow: filled {missing_samples} missing sample(s) with zeros.")]
+    CpalInputUnderflow { missing_samples: usize },
     #[cfg(feature = "jack")]
     #[error(
         "JACK sample rate changed from {expected_sample_rate} to {actual_sample_rate} while running."
@@ -460,6 +468,7 @@ mod jack_backend {
 pub mod cpal_backend {
     use crate::audio_backend::{AudioBackend, AudioBackendError};
     use crate::controller::Controller;
+    use crate::controller::MultiThreadedKnystCommands;
     use crate::graph::{RunGraph, RunGraphSettings};
     use crate::KnystError;
     use crate::Sample;
@@ -468,6 +477,43 @@ pub mod cpal_backend {
     use assert_no_alloc::*;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::Sample as CpalSampleTrait;
+
+    const CPAL_ISSUE_REPORT_INTERVAL_CALLBACKS: u32 = 128;
+
+    #[derive(Debug)]
+    struct CallbackIssueReporter {
+        callback_countdown: u32,
+        accumulated_samples: u64,
+    }
+
+    impl CallbackIssueReporter {
+        fn new() -> Self {
+            Self {
+                callback_countdown: 0,
+                accumulated_samples: 0,
+            }
+        }
+
+        fn record_issue(&mut self, samples: u64) -> Option<usize> {
+            if samples == 0 {
+                if self.callback_countdown > 0 {
+                    self.callback_countdown -= 1;
+                }
+                return None;
+            }
+
+            self.accumulated_samples += samples;
+            if self.callback_countdown == 0 {
+                self.callback_countdown = CPAL_ISSUE_REPORT_INTERVAL_CALLBACKS;
+                let to_report = self.accumulated_samples;
+                self.accumulated_samples = 0;
+                Some(to_report as usize)
+            } else {
+                self.callback_countdown -= 1;
+                None
+            }
+        }
+    }
 
     #[allow(missing_docs)]
     pub struct CpalBackendOptions {
@@ -610,6 +656,13 @@ pub mod cpal_backend {
             let graph_input_channels = graph_inputs;
             let (run_graph, resources_command_sender, resources_command_receiver) =
                 RunGraph::new(&mut graph, resources, run_graph_settings)?;
+            let controller = Controller::new(
+                graph,
+                error_handler,
+                resources_command_sender,
+                resources_command_receiver,
+            );
+            let error_commands = controller.get_knyst_commands();
             let output_stream = match output_config.sample_format() {
                 cpal::SampleFormat::F32 => run_output::<f32>(
                     &self.device,
@@ -617,6 +670,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::I16 => run_output::<i16>(
                     &self.device,
@@ -624,6 +678,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::U16 => run_output::<u16>(
                     &self.device,
@@ -631,6 +686,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::I8 => run_output::<i8>(
                     &self.device,
@@ -638,6 +694,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::I32 => run_output::<i32>(
                     &self.device,
@@ -645,6 +702,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::I64 => run_output::<i64>(
                     &self.device,
@@ -652,6 +710,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::U8 => run_output::<u8>(
                     &self.device,
@@ -659,6 +718,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::U32 => run_output::<u32>(
                     &self.device,
@@ -666,6 +726,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::U64 => run_output::<u64>(
                     &self.device,
@@ -673,6 +734,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 cpal::SampleFormat::F64 => run_output::<f64>(
                     &self.device,
@@ -680,6 +742,7 @@ pub mod cpal_backend {
                     run_graph,
                     graph_input_channels,
                     input_consumer.take(),
+                    error_commands.clone(),
                 ),
                 other => Err(AudioBackendError::UnsupportedSampleFormat(other)),
             }?;
@@ -692,36 +755,66 @@ pub mod cpal_backend {
                     .take()
                     .expect("input producer should exist after validation");
                 Some(match input_config.sample_format() {
-                    cpal::SampleFormat::F32 => {
-                        run_input::<f32>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::I16 => {
-                        run_input::<i16>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::U16 => {
-                        run_input::<u16>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::I8 => {
-                        run_input::<i8>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::I32 => {
-                        run_input::<i32>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::I64 => {
-                        run_input::<i64>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::U8 => {
-                        run_input::<u8>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::U32 => {
-                        run_input::<u32>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::U64 => {
-                        run_input::<u64>(&self.device, &input_stream_config, input_producer)
-                    }
-                    cpal::SampleFormat::F64 => {
-                        run_input::<f64>(&self.device, &input_stream_config, input_producer)
-                    }
+                    cpal::SampleFormat::F32 => run_input::<f32>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::I16 => run_input::<i16>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::U16 => run_input::<u16>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::I8 => run_input::<i8>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::I32 => run_input::<i32>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::I64 => run_input::<i64>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::U8 => run_input::<u8>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::U32 => run_input::<u32>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::U64 => run_input::<u64>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
+                    cpal::SampleFormat::F64 => run_input::<f64>(
+                        &self.device,
+                        &input_stream_config,
+                        input_producer,
+                        error_commands.clone(),
+                    ),
                     other => Err(AudioBackendError::UnsupportedSampleFormat(other)),
                 }?)
             } else {
@@ -732,12 +825,6 @@ pub mod cpal_backend {
                 output_stream,
                 input_stream,
             });
-            let controller = Controller::new(
-                graph,
-                error_handler,
-                resources_command_sender,
-                resources_command_receiver,
-            );
             Ok(controller)
         }
 
@@ -791,22 +878,27 @@ pub mod cpal_backend {
         mut run_graph: RunGraph,
         graph_input_channels: usize,
         mut input_consumer: Option<rtrb::Consumer<Sample>>,
+        error_commands: MultiThreadedKnystCommands,
     ) -> Result<cpal::Stream, AudioBackendError>
     where
         T: cpal::Sample + cpal::FromSample<Sample> + cpal::SizedSample,
     {
         let channels = config.channels as usize;
 
-        // TODO: Send error back from the audio thread in a unified way.
-        let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+        let error_commands_for_output_error = error_commands.clone();
+        let err_fn = move |err| {
+            error_commands_for_output_error.report_error(AudioBackendError::CpalStreamError(err));
+        };
 
         let mut sample_counter = 0;
         let graph_block_size = run_graph.block_size();
+        let mut underflow_reporter = CallbackIssueReporter::new();
         run_graph.run_resources_communication(50);
         run_graph.process_block();
         let stream = device.build_output_stream(
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let mut underflow_report = None;
                 let process = || {
                     for frame in output.chunks_mut(channels) {
                         if sample_counter >= graph_block_size {
@@ -816,12 +908,23 @@ pub mod cpal_backend {
                         }
                         if graph_input_channels > 0 {
                             let graph_input_buffers = run_graph.graph_input_buffers();
+                            let mut missing_samples = 0_u64;
                             for channel_i in 0..graph_input_channels {
                                 let value = input_consumer
                                     .as_mut()
-                                    .and_then(|consumer| consumer.pop().ok())
-                                    .unwrap_or(0.0);
+                                    .and_then(|consumer| consumer.pop().ok());
+                                let value = if let Some(value) = value {
+                                    value
+                                } else {
+                                    missing_samples += 1;
+                                    0.0
+                                };
                                 graph_input_buffers.write(value, channel_i, sample_counter);
+                            }
+                            if let Some(missing_samples) =
+                                underflow_reporter.record_issue(missing_samples)
+                            {
+                                underflow_report = Some(missing_samples);
                             }
                         }
                         {
@@ -839,6 +942,10 @@ pub mod cpal_backend {
                 assert_no_alloc(process);
                 #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
                 process();
+                if let Some(missing_samples) = underflow_report {
+                    error_commands
+                        .report_error(AudioBackendError::CpalInputUnderflow { missing_samples });
+                }
             },
             err_fn,
             None,
@@ -852,28 +959,44 @@ pub mod cpal_backend {
         device: &cpal::Device,
         config: &cpal::StreamConfig,
         mut input_producer: rtrb::Producer<Sample>,
+        error_commands: MultiThreadedKnystCommands,
     ) -> Result<cpal::Stream, AudioBackendError>
     where
         T: cpal::Sample + cpal::SizedSample,
         Sample: cpal::FromSample<T>,
     {
         let input_channels = config.channels as usize;
-        let err_fn = |err| eprintln!("an error occurred on input stream: {}", err);
+        let error_commands_for_input_error = error_commands.clone();
+        let err_fn = move |err| {
+            error_commands_for_input_error.report_error(AudioBackendError::CpalStreamError(err));
+        };
+        let mut overflow_reporter = CallbackIssueReporter::new();
         let stream = device.build_input_stream(
             config,
             move |input: &[T], _: &cpal::InputCallbackInfo| {
+                let mut overflow_report = None;
                 let process = || {
+                    let mut dropped_samples = 0_u64;
                     for frame in input.chunks(input_channels) {
                         for sample in frame {
                             let value = <Sample as CpalSampleTrait>::from_sample(*sample);
-                            let _ = input_producer.push(value);
+                            if input_producer.push(value).is_err() {
+                                dropped_samples += 1;
+                            }
                         }
+                    }
+                    if let Some(dropped_samples) = overflow_reporter.record_issue(dropped_samples) {
+                        overflow_report = Some(dropped_samples);
                     }
                 };
                 #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
                 assert_no_alloc(process);
                 #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
                 process();
+                if let Some(dropped_samples) = overflow_report {
+                    error_commands
+                        .report_error(AudioBackendError::CpalInputOverflow { dropped_samples });
+                }
             },
             err_fn,
             None,
@@ -884,8 +1007,29 @@ pub mod cpal_backend {
 
     #[cfg(test)]
     mod tests {
-        use super::validate_cpal_configuration;
+        use super::{validate_cpal_configuration, CallbackIssueReporter};
         use crate::audio_backend::AudioBackendError;
+
+        #[test]
+        fn callback_issue_reporter_batches_reports() {
+            let mut reporter = CallbackIssueReporter::new();
+            let first = reporter.record_issue(3);
+            assert_eq!(first, Some(3));
+            // The next issue should be accumulated until the callback budget expires.
+            assert_eq!(reporter.record_issue(2), None);
+            for _ in 0..127 {
+                assert_eq!(reporter.record_issue(0), None);
+            }
+            assert_eq!(reporter.record_issue(1), Some(3));
+        }
+
+        #[test]
+        fn callback_issue_reporter_ignores_zero_without_pending_issue() {
+            let mut reporter = CallbackIssueReporter::new();
+            for _ in 0..256 {
+                assert_eq!(reporter.record_issue(0), None);
+            }
+        }
 
         #[test]
         fn validate_cpal_configuration_rejects_output_mismatch() {
