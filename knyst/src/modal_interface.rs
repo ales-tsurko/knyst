@@ -1,460 +1,323 @@
-//! Knyst is used through a modal interface. A [`KnystSphere`] corresponds to a whole instance of Knyst. Spheres
-//! are completely separated from each other. The current sphere and active graph within a sphere is set on a thread by thread basis
-//! using thread locals. Most Knyst programs only need one sphere.
+//! Explicit context API for interacting with Knyst.
 //!
-//! Interaction with Knyst is done through the [`knyst`](crate) function which will return an object that implements [`KnystCommands`].
-//! The implementation depends on the platform.
+//! `KnystContext` is a first-class handle to one running Knyst instance. It can
+//! be passed around explicitly by host code and used without any global state.
 //!
-//! The purpose of this architecture is to allow for a highly ergonomic and concise way of interacting with the graph(s),
-//! as well as multiple underlying implementations suitable for different systems. A library targeting Knyst should
-//! work the on any platform.
-//!
-//! Most of the methods of the [`KnystCommands`] trait aren't normally needed by users but, will be used internally by handles.
-//! Using [`KnystCommands`] directly instead of using handles is discouraged.
+//! A thread-local active context helper is still provided for APIs that rely on
+//! `knyst_commands()` internally (for example many handle operations).
 
 use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{atomic::AtomicU16, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::audio_backend::AudioBackendError;
-use crate::resources::ResourcesError;
-use crate::resources::{BufferId, WavetableId};
-
-use crate::controller::KnystCommands;
-use crate::graph::{GraphSettings, NodeId, Time};
+use crate::buffer::Buffer;
+use crate::controller::{
+    CallbackHandle, KnystCommands, MultiThreadedKnystCommands, StartBeat, UploadGraphError,
+};
+use crate::graph::connection::{ConnectionBundle, InputBundle};
+use crate::graph::{
+    Connection, GenOrGraph, GraphId, GraphSettings, NodeId, ParameterChange, SimultaneousChanges,
+    Time,
+};
 use crate::handles::{GraphHandle, Handle};
-use crate::prelude::{CallbackHandle, MultiThreadedKnystCommands};
-use crate::sphere::KnystSphere;
+use crate::inspection::GraphInspection;
+use crate::resources::{BufferId, ResourcesError, WavetableId};
+use crate::scheduling::MusicalTimeMap;
+use crate::time::Beats;
 use crate::wavetable_aa::Wavetable;
 
-/// A unique id for a KnystSphere.
-#[derive(Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Debug, Hash)]
-pub struct SphereId(u16);
+/// Shared command handle that preserves mutable command state across clones.
+#[derive(Clone)]
+pub struct SharedKnystCommands {
+    commands: Arc<Mutex<MultiThreadedKnystCommands>>,
+}
 
-/// Implements KnystCommands, but does nothing except reports a warning. This is done in order to
-/// enable the infallible thread local state interface.
-pub struct DummyKnystCommands;
-impl DummyKnystCommands {
-    fn report_dummy(&self) {
-        eprintln!("No KnystCommands set, command ignored.")
-    }
-}
-/// Represents and possible implementor of [`KnystCommands`]
-pub enum UnifiedKnystCommands {
-    #[allow(missing_docs)]
-    Real(Rc<RefCell<SelectedKnystCommands>>),
-    #[allow(missing_docs)]
-    Dummy(DummyKnystCommands),
-}
-type SelectedKnystCommands = MultiThreadedKnystCommands;
-impl KnystCommands for UnifiedKnystCommands {
-    fn push_without_inputs(
-        &mut self,
-        gen_or_graph: impl crate::graph::GenOrGraph,
-    ) -> crate::graph::NodeId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().push_without_inputs(gen_or_graph),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                NodeId::new(u64::MAX)
-            }
+impl SharedKnystCommands {
+    /// Create a shared command handle from raw multithreaded commands.
+    #[must_use]
+    pub fn new(commands: MultiThreadedKnystCommands) -> Self {
+        Self {
+            commands: Arc::new(Mutex::new(commands)),
         }
     }
 
-    fn push(
-        &mut self,
-        gen_or_graph: impl crate::graph::GenOrGraph,
-        inputs: impl Into<crate::graph::connection::InputBundle>,
-    ) -> crate::graph::NodeId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().push(gen_or_graph, inputs),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                NodeId::new(u64::MAX)
-            }
-        }
+    /// Returns a snapshot clone of the underlying raw command handle.
+    #[must_use]
+    pub fn snapshot(&self) -> MultiThreadedKnystCommands {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, MultiThreadedKnystCommands> {
+        self.commands.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl KnystCommands for SharedKnystCommands {
+    fn push_without_inputs(&mut self, gen_or_graph: impl GenOrGraph) -> NodeId {
+        self.lock().push_without_inputs(gen_or_graph)
+    }
+
+    fn push(&mut self, gen_or_graph: impl GenOrGraph, inputs: impl Into<InputBundle>) -> NodeId {
+        self.lock().push(gen_or_graph, inputs)
     }
 
     fn push_to_graph_without_inputs(
         &mut self,
-        gen_or_graph: impl crate::graph::GenOrGraph,
-        graph_id: crate::graph::GraphId,
-    ) -> crate::graph::NodeId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc
-                .borrow_mut()
-                .push_to_graph_without_inputs(gen_or_graph, graph_id),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                NodeId::new(u64::MAX)
-            }
-        }
+        gen_or_graph: impl GenOrGraph,
+        graph_id: GraphId,
+    ) -> NodeId {
+        self.lock()
+            .push_to_graph_without_inputs(gen_or_graph, graph_id)
     }
 
     fn push_to_graph(
         &mut self,
-        gen_or_graph: impl crate::graph::GenOrGraph,
-        graph_id: crate::graph::GraphId,
-        inputs: impl Into<crate::graph::connection::InputBundle>,
-    ) -> crate::graph::NodeId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => {
-                kc.borrow_mut()
-                    .push_to_graph(gen_or_graph, graph_id, inputs)
-            }
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                NodeId::new(u64::MAX)
-            }
-        }
+        gen_or_graph: impl GenOrGraph,
+        graph_id: GraphId,
+        inputs: impl Into<InputBundle>,
+    ) -> NodeId {
+        self.lock().push_to_graph(gen_or_graph, graph_id, inputs)
     }
 
-    fn connect(&mut self, connection: crate::graph::Connection) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().connect(connection),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn connect(&mut self, connection: Connection) {
+        self.lock().connect(connection);
     }
 
-    fn connect_bundle(&mut self, bundle: impl Into<crate::graph::connection::ConnectionBundle>) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().connect_bundle(bundle),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn connect_bundle(&mut self, bundle: impl Into<ConnectionBundle>) {
+        self.lock().connect_bundle(bundle);
     }
 
     fn schedule_beat_callback(
         &mut self,
-        callback: impl FnMut(
-                crate::prelude::Beats,
-                &mut MultiThreadedKnystCommands,
-            ) -> Option<crate::prelude::Beats>
-            + Send
-            + 'static,
-        start_time: crate::controller::StartBeat,
-    ) -> crate::prelude::CallbackHandle {
-        match self {
-            UnifiedKnystCommands::Real(kc) => {
-                kc.borrow_mut().schedule_beat_callback(callback, start_time)
-            }
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                CallbackHandle::dummy_new()
-            }
-        }
+        callback: impl FnMut(Beats, &mut MultiThreadedKnystCommands) -> Option<Beats> + Send + 'static,
+        start_time: StartBeat,
+    ) -> CallbackHandle {
+        self.lock().schedule_beat_callback(callback, start_time)
     }
 
-    fn disconnect(&mut self, connection: crate::graph::Connection) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().disconnect(connection),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn disconnect(&mut self, connection: Connection) {
+        self.lock().disconnect(connection);
+    }
+
+    fn set_mortality(&mut self, node: NodeId, is_mortal: bool) {
+        self.lock().set_mortality(node, is_mortal);
     }
 
     fn free_disconnected_nodes(&mut self) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().free_disconnected_nodes(),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+        self.lock().free_disconnected_nodes();
     }
 
-    fn free_node_mend_connections(&mut self, node: crate::graph::NodeId) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().free_node_mend_connections(node),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn free_node_mend_connections(&mut self, node: NodeId) {
+        self.lock().free_node_mend_connections(node);
     }
 
-    fn free_node(&mut self, node: crate::graph::NodeId) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().free_node(node),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn free_node(&mut self, node: NodeId) {
+        self.lock().free_node(node);
     }
 
-    fn schedule_change(&mut self, change: crate::graph::ParameterChange) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().schedule_change(change),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn schedule_change(&mut self, change: ParameterChange) {
+        self.lock().schedule_change(change);
     }
 
-    fn schedule_changes(&mut self, changes: crate::graph::SimultaneousChanges) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().schedule_changes(changes),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn schedule_changes(&mut self, changes: SimultaneousChanges) {
+        self.lock().schedule_changes(changes);
     }
 
-    fn insert_buffer(&mut self, buffer: crate::buffer::Buffer) -> crate::resources::BufferId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().insert_buffer(buffer),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                BufferId::new(&buffer)
-            }
-        }
+    fn insert_buffer(&mut self, buffer: Buffer) -> BufferId {
+        self.lock().insert_buffer(buffer)
     }
 
-    fn remove_buffer(&mut self, buffer_id: crate::resources::BufferId) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().remove_buffer(buffer_id),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn remove_buffer(&mut self, buffer_id: BufferId) {
+        self.lock().remove_buffer(buffer_id);
     }
 
-    fn replace_buffer(
-        &mut self,
-        buffer_id: crate::resources::BufferId,
-        buffer: crate::buffer::Buffer,
-    ) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().replace_buffer(buffer_id, buffer),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn replace_buffer(&mut self, buffer_id: BufferId, buffer: Buffer) {
+        self.lock().replace_buffer(buffer_id, buffer);
     }
 
-    fn insert_wavetable(&mut self, wavetable: Wavetable) -> crate::resources::WavetableId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().insert_wavetable(wavetable),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                WavetableId::new()
-            }
-        }
+    fn insert_wavetable(&mut self, wavetable: Wavetable) -> WavetableId {
+        self.lock().insert_wavetable(wavetable)
     }
 
-    fn remove_wavetable(&mut self, wavetable_id: crate::resources::WavetableId) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().remove_wavetable(wavetable_id),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn remove_wavetable(&mut self, wavetable_id: WavetableId) {
+        self.lock().remove_wavetable(wavetable_id);
     }
 
-    fn replace_wavetable(&mut self, id: crate::resources::WavetableId, wavetable: Wavetable) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().replace_wavetable(id, wavetable),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn replace_wavetable(&mut self, id: WavetableId, wavetable: Wavetable) {
+        self.lock().replace_wavetable(id, wavetable);
     }
 
     fn change_musical_time_map(
         &mut self,
-        change_fn: impl FnOnce(&mut crate::scheduling::MusicalTimeMap) + Send + 'static,
+        change_fn: impl FnOnce(&mut MusicalTimeMap) + Send + 'static,
     ) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().change_musical_time_map(change_fn),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+        self.lock().change_musical_time_map(change_fn);
     }
 
-    fn default_graph_settings(&self) -> crate::graph::GraphSettings {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().default_graph_settings(),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                GraphSettings::default()
-            }
-        }
+    fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection> {
+        self.lock().request_inspection()
     }
 
-    fn init_local_graph(&mut self, settings: GraphSettings) -> crate::graph::GraphId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().init_local_graph(settings),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                0
-            }
-        }
+    fn default_graph_settings(&self) -> GraphSettings {
+        self.lock().default_graph_settings()
     }
 
-    fn upload_local_graph(&mut self) -> Option<Handle<GraphHandle>> {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().upload_local_graph(),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                None
-            }
-        }
-    }
-
-    fn request_inspection(
-        &mut self,
-    ) -> std::sync::mpsc::Receiver<crate::inspection::GraphInspection> {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().request_inspection(),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                std::sync::mpsc::sync_channel(0).1
-            }
-        }
-    }
-
-    fn to_graph(&mut self, graph_id: crate::graph::GraphId) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().to_graph(graph_id),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+    fn to_graph(&mut self, graph_id: GraphId) {
+        self.lock().to_graph(graph_id);
     }
 
     fn to_top_level_graph(&mut self) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().to_top_level_graph(),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+        self.lock().to_top_level_graph();
+    }
+
+    fn current_graph(&self) -> GraphId {
+        self.lock().current_graph()
+    }
+
+    fn init_local_graph(&mut self, settings: GraphSettings) -> GraphId {
+        self.lock().init_local_graph(settings)
+    }
+
+    fn upload_local_graph(&mut self) -> Option<Handle<GraphHandle>> {
+        self.lock().upload_local_graph()
     }
 
     fn start_scheduling_bundle(&mut self, time: Time) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().start_scheduling_bundle(time),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+        self.lock().start_scheduling_bundle(time);
     }
 
     fn upload_scheduling_bundle(&mut self) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().upload_scheduling_bundle(),
-            UnifiedKnystCommands::Dummy(kc) => kc.report_dummy(),
-        }
+        self.lock().upload_scheduling_bundle();
     }
-
-    fn current_graph(&self) -> crate::graph::GraphId {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().current_graph(),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-                u64::MAX
-            }
-        }
-    }
-
-    fn set_mortality(&mut self, node: NodeId, is_mortal: bool) {
-        match self {
-            UnifiedKnystCommands::Real(kc) => kc.borrow_mut().set_mortality(node, is_mortal),
-            UnifiedKnystCommands::Dummy(kc) => {
-                kc.report_dummy();
-            }
-        }
-    }
-    // fn push(&mut self) {
-    //     match self {
-    //         UnifiedKnystCommands::Real(kc) => kc.borrow_mut().push(),
-    //         UnifiedKnystCommands::Dummy(kc) => kc.push(),
-    //     }
-    // }
 }
 
-static DEFAULT_KNYST_SPHERE: AtomicU16 = AtomicU16::new(0);
-static ALL_KNYST_SPHERES: Mutex<Vec<(KnystSphere, SphereId)>> = Mutex::new(vec![]);
+/// First-class context handle for one running Knyst instance.
+#[derive(Clone)]
+pub struct KnystContext {
+    commands: SharedKnystCommands,
+}
+
+impl KnystContext {
+    /// Create a new context from command handle(s) returned by a running controller/backend.
+    #[must_use]
+    pub fn new(commands: MultiThreadedKnystCommands) -> Self {
+        Self {
+            commands: SharedKnystCommands::new(commands),
+        }
+    }
+
+    /// Return a snapshot clone of the command handle for this context.
+    ///
+    /// To preserve mutable command state across clones, use [`knyst_commands`]
+    /// or call [`KnystContext::shared_commands`].
+    #[must_use]
+    pub fn commands(&self) -> MultiThreadedKnystCommands {
+        self.commands.snapshot()
+    }
+
+    /// Return a shared command handle for this context.
+    #[must_use]
+    pub fn shared_commands(&self) -> SharedKnystCommands {
+        self.commands.clone()
+    }
+
+    /// Set this context as active for the current thread.
+    pub fn activate(&self) {
+        set_active_context(self.clone());
+    }
+
+    /// Set this context as active for the current thread and return a guard
+    /// that restores the previously active context on drop.
+    #[must_use]
+    pub fn activate_scoped(&self) -> KnystContextActivationGuard {
+        let previous = ACTIVE_KNYST_CONTEXT.with(|active| active.borrow().clone());
+        set_active_context(self.clone());
+        KnystContextActivationGuard { previous }
+    }
+
+    /// Temporarily activate this context for the current thread while running `f`.
+    pub fn with_activation<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.activate_scoped();
+        f()
+    }
+
+    /// Create a new local graph, run `init`, and upload it to this context.
+    pub fn upload_graph(
+        &self,
+        settings: GraphSettings,
+        init: impl FnOnce(),
+    ) -> Result<Handle<GraphHandle>, UploadGraphError> {
+        let mut commands = self.shared_commands();
+        commands.init_local_graph(settings);
+        init();
+        commands
+            .upload_local_graph()
+            .ok_or(UploadGraphError::LocalGraphMissing)
+    }
+
+    /// Run `c` while collecting scheduled changes, then upload as one bundle.
+    pub fn schedule_bundle(&self, time: Time, c: impl FnOnce()) {
+        let mut commands = self.shared_commands();
+        commands.start_scheduling_bundle(time);
+        c();
+        commands.upload_scheduling_bundle();
+    }
+}
 
 thread_local! {
-    static ACTIVE_KNYST_SPHERE: RefCell<SphereId> = const { RefCell::new(SphereId(0)) };
-    // The inner Rc<Refcell<>> cuts execution time to 1/3
-    static ACTIVE_KNYST_SPHERE_COMMANDS: RefCell<Option<Rc<RefCell<SelectedKnystCommands>>>> = const { RefCell::new(None) };
+    static ACTIVE_KNYST_CONTEXT: RefCell<Option<KnystContext>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn register_sphere(sphere: KnystSphere) -> Result<SphereId, SphereError> {
-    let mut spheres = match ALL_KNYST_SPHERES.lock() {
-        Ok(s) => s,
-        Err(poison) => poison.into_inner(),
-    };
-    // Get first unused sphereid
-    let mut new_id = None;
-    for i in 0..u16::MAX {
-        let mut id_found = false;
-        for (_, id) in (*spheres).iter() {
-            if id.0 == i {
-                id_found = true;
-                break;
-            }
-        }
-        if !id_found {
-            new_id = Some(SphereId(i));
-            break;
-        }
-    }
-    if let Some(id) = new_id {
-        spheres.push((sphere, id));
-        Ok(id)
-    } else {
-        Err(SphereError::NoMoreSphereIds)
-    }
+/// RAII guard that restores the previous active context when dropped.
+pub struct KnystContextActivationGuard {
+    previous: Option<KnystContext>,
 }
-pub(crate) fn remove_sphere(sphere_id: SphereId) -> Result<(), SphereError> {
-    let mut spheres = match ALL_KNYST_SPHERES.lock() {
-        Ok(s) => s,
-        Err(poison) => poison.into_inner(),
-    };
-    if let Some(index) = spheres.iter().position(|(_, id)| *id == sphere_id) {
-        let (_old_sphere, _) = spheres.remove(index);
-        if ACTIVE_KNYST_SPHERE.with(|aks| *aks.borrow_mut()) == sphere_id {
-            if let Some((_, new_active)) = spheres.first() {
-                let new_active = *new_active;
-                drop(spheres);
-                set_active_sphere(new_active)?;
-            } else {
-                ACTIVE_KNYST_SPHERE_COMMANDS.with(|aksc| {
-                    *aksc.borrow_mut() = None;
-                });
-            }
-        }
-        Ok(())
-    } else {
-        Err(SphereError::SphereNotFound)
+
+impl Drop for KnystContextActivationGuard {
+    fn drop(&mut self) {
+        ACTIVE_KNYST_CONTEXT.with(|active| {
+            *active.borrow_mut() = self.previous.clone();
+        });
     }
 }
 
-fn get_sphere_commands(sphere_id: SphereId) -> Result<MultiThreadedKnystCommands, SphereError> {
-    // If one thread panics while holding a lock to the spheres (which is highly unlikely) it should be fine to just go on accessing the spheres anyway.
-    let spheres = match ALL_KNYST_SPHERES.lock() {
-        Ok(spheres) => spheres,
-        Err(poison_lock) => poison_lock.into_inner(),
-    };
-    if let Some((sphere, _id)) = spheres.iter().find(|(_s, id)| *id == sphere_id) {
-        Ok(sphere.commands())
-    } else {
-        Err(SphereError::SphereNotFound)
-    }
+/// Set the active context for the current thread.
+///
+/// Prefer [`KnystContext::activate_scoped`] or [`KnystContext::with_activation`]
+/// to avoid leaking thread-local state outside an intended scope.
+pub fn set_active_context(context: KnystContext) {
+    ACTIVE_KNYST_CONTEXT.with(|active| {
+        *active.borrow_mut() = Some(context);
+    });
 }
 
-/// Set the selected sphere to be active on this thread.
-pub fn set_active_sphere(id: SphereId) -> Result<(), SphereError> {
-    ACTIVE_KNYST_SPHERE.with(|aks| *aks.borrow_mut() = id);
-    ACTIVE_KNYST_SPHERE_COMMANDS.with(|aksc| {
-        let kc = get_sphere_commands(id)?;
-        let kc = Some(Rc::new(RefCell::new(kc)));
-        *aksc.borrow_mut() = kc;
-        Ok(())
-    })
+/// Clear the active context for the current thread.
+pub fn clear_active_context() {
+    ACTIVE_KNYST_CONTEXT.with(|active| {
+        *active.borrow_mut() = None;
+    });
 }
 
-// Return impl KnystCommands to avoid committing to a return type and being able to change the return type through conditional compilation for different platforms
-/// Returns an implementor of [`KnystCommands`] which allows interacting with Knyst
-pub fn knyst_commands() -> impl KnystCommands {
-    if let Some(kc) = ACTIVE_KNYST_SPHERE_COMMANDS.with(|aksc| aksc.borrow().clone()) {
-        UnifiedKnystCommands::Real(kc)
-    } else {
-        // It could be the first time commands is called from this thread in which case we should try to set the default sphere
-        let default_sphere = DEFAULT_KNYST_SPHERE.load(std::sync::atomic::Ordering::SeqCst);
-        // TODO: report an error if this fails
-        set_active_sphere(SphereId(default_sphere)).ok();
-        if let Some(kc) = ACTIVE_KNYST_SPHERE_COMMANDS.with(|aksc| aksc.borrow().clone()) {
-            UnifiedKnystCommands::Real(kc)
-        } else {
-            UnifiedKnystCommands::Dummy(DummyKnystCommands)
-        }
-    }
+/// Return the active commands for this thread, if any.
+#[must_use]
+pub fn try_knyst_commands() -> Option<SharedKnystCommands> {
+    ACTIVE_KNYST_CONTEXT.with(|active| active.borrow().as_ref().map(KnystContext::shared_commands))
 }
 
-/// Error type for errors having to do with the modal commands system
+/// Returns active commands for this thread.
+///
+/// Panics if no context has been activated on this thread.
+/// Prefer using [`KnystContext::with_activation`] to ensure calls happen under
+/// an explicit scoped activation.
+pub fn knyst_commands() -> SharedKnystCommands {
+    try_knyst_commands().expect(
+        "No active KnystContext on this thread. Use KnystContext::activate() or pass commands explicitly.",
+    )
+}
+
+/// Error type for higher-level sphere startup failures.
 #[derive(thiserror::Error, Debug)]
 pub enum SphereError {
-    /// The requested KnystSphere could not be found.
-    #[error("The requested KnystSphere could not be found.")]
-    SphereNotFound,
-    /// You are out of sphere ids so you are unable to register a new sphere. I cannot think of a workload that requires this. If you are sure you need this many spheres, please file a bug report.
-    #[error("There are no sphere ids to register a new sphere. If you are sure you need this many spheres, please file a bug report.")]
-    NoMoreSphereIds,
     /// There was an error in the audio backend
     #[error("Audio backend error: {0}")]
     AudioBackendError(#[from] AudioBackendError),
@@ -463,23 +326,238 @@ pub enum SphereError {
     ResourcesError(#[from] ResourcesError),
 }
 
-// pub fn test_using() {
-//     let sphere = KnystSphere::new("First".to_owned());
-//     let _id = register_sphere(sphere).unwrap();
-//     // println!("Started sphere {_id:?}");
-//     commands().push();
-//     commands().push();
-//     let sphere = KnystSphere::new("Second".to_owned());
-//     let id2 = register_sphere(sphere).unwrap();
-//     // println!("Started sphere {id2:?}");
-//     commands().push();
-//     set_sphere(id2);
-//     commands().push();
+#[cfg(test)]
+mod tests {
+    use core::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
 
-//     let start = Instant::now();
-//     for _ in 0..10000 {
-//         commands().push();
-//     }
-//     let time_taken = start.elapsed();
-//     println!("10000 commands took {:?}", time_taken);
-// }
+    use super::{clear_active_context, knyst_commands, try_knyst_commands};
+    use crate::audio_backend::{AudioBackend, AudioBackendError};
+    use crate::controller::{print_error_handler, Controller, KnystCommands};
+    use crate::graph::{Graph, RunGraph, RunGraphSettings};
+    use crate::prelude::{KnystSphere, SphereSettings};
+    use crate::{KnystError, Resources};
+
+    struct TestBackend {
+        sample_rate: usize,
+        block_size: usize,
+        num_outputs: usize,
+        num_inputs: usize,
+        run_graph: Option<RunGraph>,
+    }
+
+    impl AudioBackend for TestBackend {
+        fn start_processing_return_controller(
+            &mut self,
+            mut graph: Graph,
+            resources: Resources,
+            run_graph_settings: RunGraphSettings,
+            error_handler: Box<dyn FnMut(KnystError) + Send + 'static>,
+        ) -> Result<Controller, AudioBackendError> {
+            if self.run_graph.is_some() {
+                return Err(AudioBackendError::BackendAlreadyRunning);
+            }
+            let (run_graph, resources_command_sender, resources_command_receiver) =
+                RunGraph::new(&mut graph, resources, run_graph_settings)?;
+            self.run_graph = Some(run_graph);
+            Ok(Controller::new(
+                graph,
+                error_handler,
+                resources_command_sender,
+                resources_command_receiver,
+            ))
+        }
+
+        fn stop(&mut self) -> Result<(), AudioBackendError> {
+            if self.run_graph.take().is_some() {
+                Ok(())
+            } else {
+                Err(AudioBackendError::BackendNotRunning)
+            }
+        }
+
+        fn sample_rate(&self) -> usize {
+            self.sample_rate
+        }
+
+        fn block_size(&self) -> Option<usize> {
+            Some(self.block_size)
+        }
+
+        fn native_output_channels(&self) -> Option<usize> {
+            Some(self.num_outputs)
+        }
+
+        fn native_input_channels(&self) -> Option<usize> {
+            Some(self.num_inputs)
+        }
+    }
+
+    #[test]
+    fn active_context_switches_command_target() {
+        let mut backend_a = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+        let mut backend_b = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        let sphere_a = KnystSphere::start(
+            &mut backend_a,
+            SphereSettings::default(),
+            print_error_handler,
+        )
+        .expect("sphere A should start");
+        let graph_a = sphere_a.commands().current_graph();
+
+        let sphere_b = KnystSphere::start(
+            &mut backend_b,
+            SphereSettings::default(),
+            print_error_handler,
+        )
+        .expect("sphere B should start");
+        let graph_b = sphere_b.commands().current_graph();
+        assert_ne!(graph_a, graph_b);
+
+        sphere_a.context().activate();
+        assert_eq!(knyst_commands().current_graph(), graph_a);
+
+        sphere_b.context().activate();
+        assert_eq!(knyst_commands().current_graph(), graph_b);
+    }
+
+    #[test]
+    fn with_activation_restores_previous_context() {
+        let mut backend_a = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+        let mut backend_b = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        let sphere_a = KnystSphere::start(
+            &mut backend_a,
+            SphereSettings::default(),
+            print_error_handler,
+        )
+        .expect("sphere A should start");
+        let graph_a = sphere_a.commands().current_graph();
+
+        let sphere_b = KnystSphere::start(
+            &mut backend_b,
+            SphereSettings::default(),
+            print_error_handler,
+        )
+        .expect("sphere B should start");
+        let graph_b = sphere_b.commands().current_graph();
+
+        sphere_a.context().activate();
+        assert_eq!(knyst_commands().current_graph(), graph_a);
+
+        sphere_b.context().with_activation(|| {
+            assert_eq!(knyst_commands().current_graph(), graph_b);
+        });
+
+        assert_eq!(knyst_commands().current_graph(), graph_a);
+        clear_active_context();
+    }
+
+    #[test]
+    fn with_activation_restores_previous_context_after_panic() {
+        let mut backend_a = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+        let mut backend_b = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        let sphere_a = KnystSphere::start(
+            &mut backend_a,
+            SphereSettings::default(),
+            print_error_handler,
+        )
+        .expect("sphere A should start");
+        let graph_a = sphere_a.commands().current_graph();
+
+        let sphere_b = KnystSphere::start(
+            &mut backend_b,
+            SphereSettings::default(),
+            print_error_handler,
+        )
+        .expect("sphere B should start");
+
+        sphere_a.context().activate();
+        assert_eq!(knyst_commands().current_graph(), graph_a);
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            sphere_b.context().with_activation(|| {
+                panic!("expected panic in test");
+            });
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(knyst_commands().current_graph(), graph_a);
+        clear_active_context();
+    }
+
+    #[test]
+    fn active_context_is_thread_local() {
+        let mut backend = TestBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        let sphere =
+            KnystSphere::start(&mut backend, SphereSettings::default(), print_error_handler)
+                .expect("sphere should start");
+        let graph = sphere.commands().current_graph();
+        let context = sphere.context();
+        context.activate();
+        assert_eq!(knyst_commands().current_graph(), graph);
+
+        let worker_context = context.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(
+                try_knyst_commands().is_none(),
+                "worker thread should not inherit active context"
+            );
+            worker_context.with_activation(|| {
+                assert_eq!(knyst_commands().current_graph(), graph);
+            });
+            assert!(
+                try_knyst_commands().is_none(),
+                "worker thread should restore previous (none) context"
+            );
+        });
+        worker.join().expect("worker thread should complete");
+
+        assert_eq!(knyst_commands().current_graph(), graph);
+        clear_active_context();
+    }
+}

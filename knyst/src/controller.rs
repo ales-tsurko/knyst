@@ -745,11 +745,6 @@ impl CallbackHandle {
         self.free_flag
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    pub(crate) fn dummy_new() -> Self {
-        Self {
-            free_flag: Arc::new(AtomicBool::new(true)),
-        }
-    }
 }
 
 /// The beat on which a callback should start, either an absolute beat value or the next multiple of some number of beats.

@@ -16,7 +16,9 @@ pub use crate::handles::{
     bus, graph_input, graph_output, handle, GenericHandle, GraphHandle, Handle, HandleData,
 };
 pub use crate::inputs;
-pub use crate::modal_interface::knyst_commands;
+pub use crate::modal_interface::{
+    clear_active_context, knyst_commands, set_active_context, KnystContext,
+};
 pub use crate::resources::{IdOrKey, WavetableId, WavetableKey};
 pub use crate::resources::{Resources, ResourcesSettings};
 pub use crate::sphere::{KnystSphere, SphereSettings};

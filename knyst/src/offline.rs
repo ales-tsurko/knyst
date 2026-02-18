@@ -5,16 +5,16 @@ use crate::{
     audio_backend::AudioBackend,
     controller::{print_error_handler, Controller},
     graph::RunGraph,
-    modal_interface::{remove_sphere, set_active_sphere, SphereId},
+    modal_interface::KnystContext,
     prelude::{KnystSphere, SphereSettings},
     Sample,
 };
 
-/// For running and inspecting the output of Knyst offline i.e. generating buffers of samples without outputing them anywhere. Removes the associated KnystSphere when dropped.
+/// For running and inspecting the output of Knyst offline i.e. generating buffers of samples without outputing them anywhere.
 pub struct KnystOffline {
     test_backend: OfflineBackend,
     controller: Controller,
-    sphere_id: SphereId,
+    context: KnystContext,
 }
 impl KnystOffline {
     /// Creates an offline Knyst sphere and activates it. You can then use the modal knyst API as
@@ -32,7 +32,7 @@ impl KnystOffline {
             num_outputs,
             run_graph: None,
         };
-        let (sphere_id, controller) = KnystSphere::start_return_controller(
+        let (sphere, controller) = KnystSphere::start_return_controller(
             &mut backend,
             SphereSettings {
                 num_inputs: 0,
@@ -42,16 +42,17 @@ impl KnystOffline {
             print_error_handler,
         )
         .unwrap();
-        set_active_sphere(sphere_id).unwrap();
+        let context = sphere.context();
+        context.activate();
         KnystOffline {
             test_backend: backend,
             controller,
-            sphere_id,
+            context,
         }
     }
-    /// Returns the [`SphereId`] of the offline sphere
-    pub fn sphere_id(&self) -> SphereId {
-        self.sphere_id
+    /// Returns the explicit context of the offline sphere.
+    pub fn context(&self) -> KnystContext {
+        self.context.clone()
     }
     /// Process one block of audio, incl controller
     pub fn process_block(&mut self) {
@@ -96,11 +97,6 @@ impl KnystOffline {
         } else {
             None
         }
-    }
-}
-impl Drop for KnystOffline {
-    fn drop(&mut self) {
-        remove_sphere(self.sphere_id).unwrap();
     }
 }
 
@@ -239,5 +235,29 @@ mod tests {
             second_stop,
             Err(AudioBackendError::BackendNotRunning)
         ));
+    }
+
+    #[test]
+    fn offline_backend_start_stop_restart_cycles() {
+        let mut backend = OfflineBackend {
+            sample_rate: 44_100,
+            block_size: 64,
+            num_outputs: 2,
+            num_inputs: 0,
+            run_graph: None,
+        };
+
+        for _ in 0..16 {
+            let started = backend.start_processing_return_controller(
+                test_graph(44_100, 64, 2),
+                test_resources(),
+                RunGraphSettings::default(),
+                Box::new(|_| {}),
+            );
+            assert!(started.is_ok(), "start should succeed for each cycle");
+
+            let stopped = backend.stop();
+            assert!(stopped.is_ok(), "stop should succeed for each cycle");
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! A [`KnystSphere`] contains one instance of Knyst running on a backend. You can
-//! create multiple [`KnystSphere`]s in one program and switch between them using
-//! [`set_active_sphere`], but most use cases require only one [`KnystSphere`].
+//! create multiple [`KnystSphere`]s in one program and keep an explicit
+//! [`crate::modal_interface::KnystContext`] for each one.
 
 use crate::controller::Controller;
 #[allow(unused)]
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::{
     graph::{Graph, GraphSettings, RunGraphSettings},
-    modal_interface::{register_sphere, set_active_sphere, SphereError, SphereId},
+    modal_interface::{KnystContext, SphereError},
     prelude::{AudioBackend, MultiThreadedKnystCommands},
 };
 
@@ -19,7 +19,7 @@ use crate::{
 pub struct KnystSphere {
     #[allow(unused)]
     name: String,
-    knyst_commands: MultiThreadedKnystCommands,
+    context: KnystContext,
 }
 
 impl KnystSphere {
@@ -28,7 +28,7 @@ impl KnystSphere {
         backend: &mut B,
         settings: SphereSettings,
         error_handler: impl FnMut(KnystError) + Send + 'static,
-    ) -> Result<SphereId, SphereError> {
+    ) -> Result<Self, SphereError> {
         let resources = Resources::new(settings.resources_settings)?;
         let graph_settings = GraphSettings {
             name: settings.name.clone(),
@@ -53,13 +53,10 @@ impl KnystSphere {
         )?;
         let s = Self {
             name: settings.name,
-            knyst_commands: k,
+            context: KnystContext::new(k),
         };
-        // Add the sphere to the global list of spheres
-        let sphere_id = register_sphere(s)?;
-        // Set the sphere to be active
-        set_active_sphere(sphere_id)?;
-        Ok(sphere_id)
+        s.context.activate();
+        Ok(s)
     }
     /// Start the sphere and upload it, but return the Controller and make it the user's responsibility.
     /// Unless you are implementing a custom backend solution, you probably want the [`KnystSphere::start`] method.
@@ -67,7 +64,7 @@ impl KnystSphere {
         backend: &mut B,
         settings: SphereSettings,
         error_handler: impl FnMut(KnystError) + Send + 'static,
-    ) -> Result<(SphereId, Controller), SphereError> {
+    ) -> Result<(Self, Controller), SphereError> {
         let resources = Resources::new(settings.resources_settings)?;
         let graph_settings = GraphSettings {
             name: settings.name.clone(),
@@ -93,18 +90,21 @@ impl KnystSphere {
         )?;
         let s = Self {
             name: settings.name,
-            knyst_commands: controller.get_knyst_commands(),
+            context: KnystContext::new(controller.get_knyst_commands()),
         };
-        // Add the sphere to the global list of spheres
-        let sphere_id = register_sphere(s)?;
-        // Set the sphere to be active
-        set_active_sphere(sphere_id)?;
-        Ok((sphere_id, controller))
+        s.context.activate();
+        Ok((s, controller))
     }
     /// Return an object implementing [`KnystCommands`]
     #[must_use]
     pub fn commands(&self) -> MultiThreadedKnystCommands {
-        self.knyst_commands.clone()
+        self.context.commands()
+    }
+
+    /// Return the explicit context for this sphere.
+    #[must_use]
+    pub fn context(&self) -> KnystContext {
+        self.context.clone()
     }
 }
 
