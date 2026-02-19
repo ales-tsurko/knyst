@@ -588,6 +588,7 @@ fn scheduling() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::from_millis(0),
+            ..Default::default()
         },
     );
     let node0 = graph.push(OneGen {});
@@ -858,6 +859,7 @@ fn sending_buffer_to_resources() {
         resources,
         RunGraphSettings {
             scheduling_latency: Duration::from_secs(0),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -990,6 +992,7 @@ fn beat_scheduling() {
         Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
         RunGraphSettings {
             scheduling_latency: Duration::new(0, 0),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1090,6 +1093,7 @@ fn inner_graph_different_block_size() {
         Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
         RunGraphSettings {
             scheduling_latency: Duration::new(0, 0),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1169,6 +1173,7 @@ fn inner_graph_different_oversampling() {
         Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
         RunGraphSettings {
             scheduling_latency: Duration::new(0, 0),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1304,6 +1309,7 @@ fn transport_pause_play_and_seek_seconds() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::ZERO,
+            ..Default::default()
         },
     );
 
@@ -1358,6 +1364,7 @@ fn transport_seek_beats_uses_musical_time_map() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::ZERO,
+            ..Default::default()
         },
     );
 
@@ -1399,6 +1406,7 @@ fn transport_schedule_while_paused_applies_after_resume() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::ZERO,
+            ..Default::default()
         },
     );
 
@@ -1456,6 +1464,7 @@ fn transport_seek_forward_drops_dense_future_queue() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::ZERO,
+            ..Default::default()
         },
     );
 
@@ -1515,6 +1524,7 @@ fn transport_play_pause_seek_stress_does_not_break_snapshot() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::ZERO,
+            ..Default::default()
         },
     );
 
@@ -1560,6 +1570,7 @@ fn transport_long_run_has_no_clock_drift() {
         &mut graph,
         RunGraphSettings {
             scheduling_latency: Duration::ZERO,
+            ..Default::default()
         },
     );
 

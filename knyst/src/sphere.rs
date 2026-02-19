@@ -48,6 +48,8 @@ impl KnystSphere {
             resources,
             RunGraphSettings {
                 scheduling_latency: settings.scheduling_latency,
+                resources_command_queue_capacity: settings.resources_command_queue_capacity,
+                resources_response_queue_capacity: settings.resources_response_queue_capacity,
             },
             Box::new(error_handler),
         )?;
@@ -85,6 +87,8 @@ impl KnystSphere {
             resources,
             RunGraphSettings {
                 scheduling_latency: settings.scheduling_latency,
+                resources_command_queue_capacity: settings.resources_command_queue_capacity,
+                resources_response_queue_capacity: settings.resources_response_queue_capacity,
             },
             Box::new(error_handler),
         )?;
@@ -126,6 +130,10 @@ pub struct SphereSettings {
     pub scheduling_latency: Duration,
     /// The capacity of the ring buffer transferring changes to constant inputs to the audio thread.
     pub scheduling_ring_buffer_capacity: usize,
+    /// Capacity of the ring buffer carrying resource commands to the audio thread.
+    pub resources_command_queue_capacity: usize,
+    /// Capacity of the ring buffer carrying resource responses from the audio thread.
+    pub resources_response_queue_capacity: usize,
 }
 
 impl Default for SphereSettings {
@@ -137,6 +145,8 @@ impl Default for SphereSettings {
             num_inputs: 2,
             num_outputs: 2,
             scheduling_ring_buffer_capacity: 1000,
+            resources_command_queue_capacity: 50,
+            resources_response_queue_capacity: 50,
         }
     }
 }

@@ -54,6 +54,12 @@ impl RunGraph {
         ),
         RunGraphError,
     > {
+        if settings.resources_command_queue_capacity == 0 {
+            return Err(RunGraphError::InvalidResourcesCommandQueueCapacity(0));
+        }
+        if settings.resources_response_queue_capacity == 0 {
+            return Err(RunGraphError::InvalidResourcesResponseQueueCapacity(0));
+        }
         // Create a new dummy NodeId since it doesn't matter; we know
         // that the Graph will not do anything with its NodeId in its init function
         // and the top level graph doesn't have a NodeId anyway.
@@ -88,8 +94,10 @@ impl RunGraph {
                 // Run a first update to make sure any queued changes get sent to the GraphGen
                 graph.update();
                 // Create ring buffer channels for communicating with Resources
-                let (resources_command_sender, resources_command_receiver) = RingBuffer::new(50);
-                let (resources_response_sender, resources_response_receiver) = RingBuffer::new(50);
+                let (resources_command_sender, resources_command_receiver) =
+                    RingBuffer::new(settings.resources_command_queue_capacity);
+                let (resources_response_sender, resources_response_receiver) =
+                    RingBuffer::new(settings.resources_response_queue_capacity);
                 Ok((
                     Self {
                         graph_node,
@@ -185,17 +193,106 @@ unsafe impl Send for RunGraph {}
 pub enum RunGraphError {
     #[error("Unable to create a node from the Graph: {0}")]
     CouldNodeCreateNode(String),
+    #[error("Invalid resources command queue capacity: {0}. Capacity must be greater than zero.")]
+    InvalidResourcesCommandQueueCapacity(usize),
+    #[error("Invalid resources response queue capacity: {0}. Capacity must be greater than zero.")]
+    InvalidResourcesResponseQueueCapacity(usize),
 }
 
 /// Settings for a [`RunGraph`]
 pub struct RunGraphSettings {
     /// How much time is added to every *relative* scheduling event to ensure the Change has time to travel to the GraphGen.
     pub scheduling_latency: Duration,
+    /// Capacity of the ring buffer carrying resource commands to the audio thread.
+    pub resources_command_queue_capacity: usize,
+    /// Capacity of the ring buffer carrying resource responses from the audio thread.
+    pub resources_response_queue_capacity: usize,
 }
 impl Default for RunGraphSettings {
     fn default() -> Self {
         Self {
             scheduling_latency: Duration::from_millis(50),
+            resources_command_queue_capacity: 50,
+            resources_response_queue_capacity: 50,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunGraph, RunGraphError, RunGraphSettings};
+    use crate::graph::{Graph, GraphSettings};
+    use crate::resources::{Resources, ResourcesCommand, ResourcesSettings, WavetableId};
+
+    fn test_graph_and_resources() -> (Graph, Resources) {
+        (
+            Graph::new(GraphSettings::default()),
+            Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
+        )
+    }
+
+    #[test]
+    fn rejects_zero_resources_command_queue_capacity() {
+        let (mut graph, resources) = test_graph_and_resources();
+        let result = RunGraph::new(
+            &mut graph,
+            resources,
+            RunGraphSettings {
+                resources_command_queue_capacity: 0,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(RunGraphError::InvalidResourcesCommandQueueCapacity(0))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_resources_response_queue_capacity() {
+        let (mut graph, resources) = test_graph_and_resources();
+        let result = RunGraph::new(
+            &mut graph,
+            resources,
+            RunGraphSettings {
+                resources_response_queue_capacity: 0,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(RunGraphError::InvalidResourcesResponseQueueCapacity(0))
+        ));
+    }
+
+    #[test]
+    fn applies_configured_resources_queue_capacities() {
+        let (mut graph, resources) = test_graph_and_resources();
+        let settings = RunGraphSettings {
+            resources_command_queue_capacity: 8,
+            resources_response_queue_capacity: 3,
+            ..Default::default()
+        };
+        let (mut run_graph, mut command_sender, response_receiver) =
+            RunGraph::new(&mut graph, resources, settings).expect("RunGraph should initialize");
+
+        for _ in 0..8 {
+            command_sender
+                .push(ResourcesCommand::RemoveWavetable {
+                    id: WavetableId::new(),
+                })
+                .expect("command queue should accept values up to configured capacity");
+        }
+        assert!(
+            command_sender
+                .push(ResourcesCommand::RemoveWavetable {
+                    id: WavetableId::new(),
+                })
+                .is_err(),
+            "command queue should be full at configured capacity"
+        );
+
+        run_graph.run_resources_communication(usize::MAX);
+        assert_eq!(response_receiver.slots(), 3);
     }
 }

@@ -34,6 +34,7 @@ fn main() -> Result<()> {
             resources,
             RunGraphSettings {
                 scheduling_latency: Duration::from_millis(100),
+                ..Default::default()
             },
             Box::new(print_error_handler),
         )

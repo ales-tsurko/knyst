@@ -152,6 +152,7 @@ mod tests {
             Resources::new(ResourcesSettings::default()).expect("test resources should initialize"),
             RunGraphSettings {
                 scheduling_latency: Duration::new(0, 0),
+                ..Default::default()
             },
         )
         .unwrap();
