@@ -106,6 +106,7 @@ impl Node {
         input_buffers: &NodeBufferRef,
         sample_rate: Sample,
         resources: &mut Resources,
+        transport: Option<crate::gen::TransportContext<'_>>,
     ) -> GenState {
         let mut outputs = NodeBufferRef::new(
             self.output_buffers_first_ptr,
@@ -116,6 +117,7 @@ impl Node {
             inputs: input_buffers,
             outputs: &mut outputs,
             sample_rate,
+            transport,
         };
         unsafe { (*self.gen).process(ctx, resources) }
     }

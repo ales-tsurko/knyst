@@ -1590,3 +1590,83 @@ fn transport_long_run_has_no_clock_drift() {
         expected_samples
     );
 }
+
+#[test]
+fn transport_beats_gen_outputs_audio_rate_beats() {
+    let sample_rate = 8;
+    let block_size = 4;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let transport_beats = graph.push(TransportBeatsGen);
+    graph
+        .connect(transport_beats.to_graph_out())
+        .expect("connection should succeed");
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    graph
+        .change_musical_time_map(|map| {
+            map.replace(0, TempoChange::NewTempo { bpm: 120.0 });
+        })
+        .expect("tempo map update should succeed");
+
+    graph.update();
+    run_graph.process_block();
+    let output = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(output, &[0.0, 0.25, 0.5, 0.75]);
+}
+
+#[test]
+fn transport_beats_gen_holds_position_while_paused_and_tracks_seek() {
+    let sample_rate = 8;
+    let block_size = 4;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let transport_beats = graph.push(TransportBeatsGen);
+    graph
+        .connect(transport_beats.to_graph_out())
+        .expect("connection should succeed");
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    graph
+        .change_musical_time_map(|map| {
+            map.replace(0, TempoChange::NewTempo { bpm: 60.0 });
+        })
+        .expect("tempo map update should succeed");
+
+    graph
+        .transport_seek_to_beats(Beats::from_beats(4))
+        .expect("seek should succeed");
+    graph
+        .transport_pause()
+        .expect("transport pause should succeed");
+    graph.update();
+    run_graph.process_block();
+    let paused = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(paused, &[4.0, 4.0, 4.0, 4.0]);
+
+    graph
+        .transport_play()
+        .expect("transport play should succeed");
+    graph.update();
+    run_graph.process_block();
+    let resumed = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(resumed, &[4.0, 4.125, 4.25, 4.375]);
+}

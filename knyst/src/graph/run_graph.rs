@@ -152,6 +152,7 @@ impl RunGraph {
             &self.input_node_buffer_ref,
             self.graph_sample_rate,
             &mut self.resources,
+            None,
         );
     }
     /// Return a reference to the buffer holding the output of the [`Graph`].

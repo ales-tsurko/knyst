@@ -10,8 +10,17 @@ pub use basic_gens::*;
 mod smoothing;
 pub use smoothing::*;
 mod osc;
-use crate::{graph::NodeId, node_buffer::NodeBufferRef, resources::Resources, Sample};
+pub mod transport;
+use crate::{
+    graph::{NodeId, TransportState},
+    node_buffer::NodeBufferRef,
+    resources::Resources,
+    scheduling::MusicalTimeMap,
+    time::{Beats, Seconds},
+    Sample,
+};
 pub use osc::*;
+pub use transport::*;
 pub mod delay;
 pub mod filter;
 
@@ -56,15 +65,96 @@ pub trait Gen {
 }
 
 /// Gives access to the inputs and outputs buffers of a node for processing.
-pub struct GenContext<'a, 'b> {
+#[derive(Clone, Copy)]
+pub struct TransportContext<'a> {
+    state: TransportState,
+    block_start_samples: u64,
+    sample_rate: Sample,
+    musical_time_map: Option<&'a MusicalTimeMap>,
+}
+
+impl<'a> TransportContext<'a> {
+    pub(crate) fn new(
+        state: TransportState,
+        block_start_samples: u64,
+        sample_rate: Sample,
+        musical_time_map: Option<&'a MusicalTimeMap>,
+    ) -> Self {
+        Self {
+            state,
+            block_start_samples,
+            sample_rate,
+            musical_time_map,
+        }
+    }
+
+    /// Returns the current transport state.
+    pub fn state(&self) -> TransportState {
+        self.state
+    }
+
+    /// Returns the graph sample rate used by this transport context.
+    pub fn sample_rate(&self) -> Sample {
+        self.sample_rate
+    }
+
+    /// Returns the transport sample position at the start of the current block.
+    pub fn block_start_samples(&self) -> u64 {
+        self.block_start_samples
+    }
+
+    /// Returns the transport sample position for one frame offset in the current block.
+    pub fn samples_at(&self, frame_offset: usize) -> u64 {
+        match self.state {
+            TransportState::Playing => self.block_start_samples.saturating_add(frame_offset as u64),
+            TransportState::Paused => self.block_start_samples,
+        }
+    }
+
+    /// Returns the transport seconds position for one frame offset in the current block.
+    pub fn seconds_at(&self, frame_offset: usize) -> Seconds {
+        Seconds::from_samples(self.samples_at(frame_offset), self.sample_rate as u64)
+    }
+
+    /// Returns the transport beats position for one frame offset in the current block.
+    pub fn beats_at(&self, frame_offset: usize) -> Option<Beats> {
+        self.musical_time_map
+            .map(|map| map.seconds_to_beats(self.seconds_at(frame_offset)))
+    }
+
+    pub(crate) fn advanced(self, frame_offset: usize) -> Self {
+        Self {
+            block_start_samples: self.samples_at(frame_offset),
+            ..self
+        }
+    }
+
+    pub(crate) fn resampled(self, sample_rate: Sample) -> Self {
+        if self.sample_rate == sample_rate {
+            return self;
+        }
+        let scaled_samples = ((self.block_start_samples as f64) * (sample_rate as f64)
+            / (self.sample_rate as f64)) as u64;
+        Self {
+            block_start_samples: scaled_samples,
+            sample_rate,
+            ..self
+        }
+    }
+}
+
+/// Gives access to the inputs and outputs buffers of a node for processing.
+pub struct GenContext<'a, 'b, 'c> {
     /// Input buffers to the Gen.
     pub inputs: &'a NodeBufferRef,
     /// Output buffers the Gen is supposed to fill.
     pub outputs: &'b mut NodeBufferRef,
     /// The sample rate of the [`Graph`] that the current Gen is in.
     pub sample_rate: Sample,
+    /// The current transport context for this block, if transport is available.
+    pub transport: Option<TransportContext<'c>>,
 }
-impl<'a, 'b> GenContext<'a, 'b> {
+impl<'a, 'b, 'c> GenContext<'a, 'b, 'c> {
     /// Returns the current block size
     pub fn block_size(&self) -> usize {
         self.outputs.block_size()

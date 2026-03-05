@@ -1,12 +1,12 @@
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, RwLock,
 };
 use std::time::Instant;
 
 use rtrb::Producer;
 
-use crate::{internal_filter::hiir::StandardDownsampler2X, Resources};
+use crate::{internal_filter::hiir::StandardDownsampler2X, scheduling::MusicalTimeMap, Resources};
 
 use super::{
     node::Node, Gen, GenContext, GenState, NodeBufferRef, NodeId, NodeKey, ObservabilityState,
@@ -70,6 +70,8 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         new_task_data_consumer,
         _arc_inputs_buffers_ptr: arc_inputs_buffers_ptr,
         observability,
+        musical_time_map: None,
+        transport_clock: None,
     });
     // TODO:
     // If the graph is the same as the parent Graph, do no conversion.
@@ -182,8 +184,13 @@ impl GraphBlockConverterGen {
         gen_state: &mut GenState,
     ) {
         if *batch_counter == num_batches {
-            *gen_state =
-                graph_gen_node.process(&NodeBufferRef::null_buffer(), ctx.sample_rate, resources);
+            *gen_state = graph_gen_node.process(
+                &NodeBufferRef::null_buffer(),
+                ctx.sample_rate,
+                resources,
+                ctx.transport
+                    .map(|transport| transport.advanced(*batch_counter * parent_block_size)),
+            );
             *batch_counter = 0;
         }
 
@@ -218,9 +225,13 @@ impl GraphBlockConverterGen {
             }
             // GraphBlockConverterGen does not convert sample rate so just
             // use the sample rate from upstream
-            let returned_gen_state =
-                self.graph_gen_node
-                    .process(input_buffers, ctx.sample_rate, resources);
+            let returned_gen_state = self.graph_gen_node.process(
+                input_buffers,
+                ctx.sample_rate,
+                resources,
+                ctx.transport
+                    .map(|transport| transport.advanced(batch_sample_offset)),
+            );
             // Copy the outputs of the node to the outputs of this Gen
             for output_num in 0..ctx.outputs.channels() {
                 for sample in 0..self.inner_block_size {
@@ -435,7 +446,13 @@ impl Gen for GraphConvertOversampling2XGen {
 
         // The GraphGen does nothing with the sample rate parameter sent here,
         // replacing it by its own sample rate.
-        let gen_state = self.graph_gen_node.process(&input_buffers, 0., resources);
+        let gen_state = self.graph_gen_node.process(
+            &input_buffers,
+            0.,
+            resources,
+            ctx.transport
+                .map(|transport| transport.resampled(self.inner_sample_rate)),
+        );
         // dbg!(self.graph_gen_node.output_buffers().get_channel(0));
 
         // TODO: Remove this step if we can get NodeBufferRef compatible with &[AsRef<[Sample]>]
@@ -553,6 +570,8 @@ pub(super) struct GraphGen {
     task_data_to_be_dropped_producer: rtrb::Producer<TaskData>,
     new_task_data_consumer: rtrb::Consumer<TaskData>,
     observability: Arc<ObservabilityState>,
+    musical_time_map: Option<Arc<RwLock<MusicalTimeMap>>>,
+    transport_clock: Option<super::TransportClock>,
 }
 
 impl Gen for GraphGen {
@@ -572,6 +591,12 @@ impl Gen for GraphGen {
                     self.schedule_receiver.clock_update(self.sample_rate)
                 {
                     self.sample_counter = new_sample_counter;
+                }
+                if let Some((transport_clock, musical_time_map)) =
+                    self.schedule_receiver.transport_update(self.sample_rate)
+                {
+                    self.transport_clock = Some(transport_clock);
+                    self.musical_time_map = Some(musical_time_map);
                 }
                 let mut do_empty_buffer = None;
                 let mut do_mend_connections = None;
@@ -606,6 +631,22 @@ impl Gen for GraphGen {
                 }
 
                 let changes = self.schedule_receiver.changes();
+                let musical_time_map_guard = self
+                    .musical_time_map
+                    .as_ref()
+                    .and_then(|musical_time_map| musical_time_map.read().ok());
+                let block_transport = if let Some(transport) = ctx.transport {
+                    Some(transport.resampled(self.sample_rate))
+                } else {
+                    self.transport_clock.map(|transport_clock| {
+                        crate::gen::TransportContext::new(
+                            transport_clock.state,
+                            transport_clock.position_samples(self.sample_counter),
+                            self.sample_rate,
+                            musical_time_map_guard.as_deref(),
+                        )
+                    })
+                };
 
                 // Run the tasks
                 for task in tasks.iter_mut() {
@@ -642,7 +683,13 @@ impl Gen for GraphGen {
                             i += 1;
                         }
                     }
-                    match task.run(ctx.inputs, resources, self.sample_rate, self.sample_counter) {
+                    match task.run(
+                        ctx.inputs,
+                        resources,
+                        self.sample_rate,
+                        self.sample_counter,
+                        block_transport,
+                    ) {
                         GenState::Continue => (),
                         GenState::FreeSelf => {
                             // We don't care if it fails since if it does the
