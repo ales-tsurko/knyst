@@ -12,7 +12,7 @@ use crate::controller::KnystCommands;
 use crate::gen::{BufferReader, WavetableOscillatorOwned};
 use crate::graph::{FreeError, Oversampling, ScheduleError};
 use crate::prelude::*;
-use crate::scheduling::TempoChange;
+use crate::scheduling::{TempoChange, TempoCurve, TempoCurveSegment};
 use crate::time::{Beats, Seconds};
 use crate::{controller::Controller, graph::connection::constant};
 
@@ -1386,6 +1386,52 @@ fn transport_seek_beats_uses_musical_time_map() {
 }
 
 #[test]
+fn transport_seek_beats_uses_tempo_curve() {
+    let sample_rate = 100;
+    let block_size = 10;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let _run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+
+    graph
+        .change_musical_time_map(|map| {
+            let tempo_curve = TempoCurve::new(
+                Seconds::ZERO,
+                60.0,
+                vec![
+                    TempoCurveSegment::new(Seconds::from_seconds_f64(4.0), 120.0, 0.0)
+                        .expect("segment should be valid"),
+                ],
+            )
+            .expect("curve should be valid");
+            map.set_tempo_curve(tempo_curve);
+        })
+        .expect("tempo curve update should succeed");
+    graph
+        .transport_seek_to_beats(Beats::from_beats_f64(2.5))
+        .expect("transport seek in beats should succeed");
+
+    let snapshot = graph
+        .transport_snapshot()
+        .expect("transport snapshot should be available");
+    let beats = snapshot
+        .beats
+        .expect("transport snapshot should contain beats with tempo curve");
+    assert!((beats.as_beats_f64() - 2.5).abs() < 1e-6);
+    assert_eq!(snapshot.seconds.to_samples(sample_rate as u64), 200);
+}
+
+#[test]
 fn transport_schedule_while_paused_applies_after_resume() {
     let sample_rate = 8;
     let block_size = 4;
@@ -1669,4 +1715,46 @@ fn transport_beats_gen_holds_position_while_paused_and_tracks_seek() {
     run_graph.process_block();
     let resumed = run_graph.graph_output_buffers().get_channel(0);
     assert_eq!(resumed, &[4.0, 4.125, 4.25, 4.375]);
+}
+
+#[test]
+fn transport_beats_gen_follows_tempo_curve() {
+    let sample_rate = 4;
+    let block_size = 4;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let transport_beats = graph.push(TransportBeatsGen);
+    graph
+        .connect(transport_beats.to_graph_out())
+        .expect("connection should succeed");
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    graph
+        .change_musical_time_map(|map| {
+            let tempo_curve = TempoCurve::new(
+                Seconds::ZERO,
+                60.0,
+                vec![
+                    TempoCurveSegment::new(Seconds::from_seconds_f64(4.0), 120.0, 0.0)
+                        .expect("segment should be valid"),
+                ],
+            )
+            .expect("curve should be valid");
+            map.set_tempo_curve(tempo_curve);
+        })
+        .expect("tempo curve update should succeed");
+
+    graph.update();
+    run_graph.process_block();
+    let output = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(output, &[0.0, 0.2578125, 0.53125, 0.8203125]);
 }
