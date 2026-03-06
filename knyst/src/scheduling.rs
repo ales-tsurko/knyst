@@ -7,6 +7,7 @@ use crate::time::{Beats, Seconds};
 
 /// A change in musical tempo for use in a [`MusicalTimeMap`].
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
 pub enum TempoChange {
     /// New BPM value.
     NewTempo {
@@ -41,6 +42,7 @@ pub enum TempoCurveError {
 
 /// One curved tempo segment relative to the previous tempo point.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
 pub struct TempoCurveSegment {
     duration: Seconds,
     target_bpm: f64,
@@ -76,6 +78,7 @@ impl TempoCurveSegment {
 
 /// One full continuous transport tempo description anchored in seconds.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
 pub struct TempoCurve {
     start_position: Seconds,
     start_bpm: f64,
