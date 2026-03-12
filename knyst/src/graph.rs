@@ -383,6 +383,7 @@ pub enum Time {
 }
 
 /// Playback state of the transport timeline.
+#[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportState {
     /// Transport timeline advances with audio time.
@@ -392,6 +393,7 @@ pub enum TransportState {
 }
 
 /// Snapshot of the transport timeline position.
+#[cfg_attr(feature = "serde-derive", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportSnapshot {
     /// Current transport state.
