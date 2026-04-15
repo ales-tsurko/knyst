@@ -918,7 +918,7 @@ pub mod cpal_backend {
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let mut underflow_report = None;
-                let process = || {
+                let mut process = || {
                     for frame in output.chunks_mut(channels) {
                         if sample_counter >= graph_block_size {
                             run_graph.run_resources_communication(50);
@@ -995,7 +995,7 @@ pub mod cpal_backend {
             config,
             move |input: &[T], _: &cpal::InputCallbackInfo| {
                 let mut overflow_report = None;
-                let process = || {
+                let mut process = || {
                     let mut dropped_samples = 0_u64;
                     for frame in input.chunks(input_channels) {
                         for sample in frame {
