@@ -12,7 +12,7 @@ pub use smoothing::*;
 mod osc;
 pub mod transport;
 use crate::{
-    graph::{NodeId, TransportState},
+    graph::{BlockEvent, NodeId, TransportState},
     node_buffer::NodeBufferRef,
     resources::Resources,
     scheduling::MusicalTimeMap,
@@ -51,6 +51,17 @@ pub trait Gen {
     /// Return a label for a given input channel index. This sets the label in the [`Connection`] API.
     #[allow(unused)]
     fn input_desc(&self, input: usize) -> &'static str {
+        ""
+    }
+    /// The number of event inputs this `Gen` takes. Events are delivered in
+    /// [`GenContext::events`] with block-local sample offsets.
+    #[allow(unused)]
+    fn num_event_inputs(&self) -> usize {
+        0
+    }
+    /// Return a label for a given event input channel index.
+    #[allow(unused)]
+    fn event_input_desc(&self, input: usize) -> &'static str {
         ""
     }
     /// Return a label for a given output channel index. This sets the label in the [`Connection`] API.
@@ -149,6 +160,8 @@ pub struct GenContext<'a, 'b, 'c> {
     pub inputs: &'a NodeBufferRef,
     /// Output buffers the Gen is supposed to fill.
     pub outputs: &'b mut NodeBufferRef,
+    /// Block-local events delivered to this node for the current block.
+    pub events: &'a [BlockEvent],
     /// The sample rate of the [`Graph`] that the current Gen is in.
     pub sample_rate: Sample,
     /// The current transport context for this block, if transport is available.

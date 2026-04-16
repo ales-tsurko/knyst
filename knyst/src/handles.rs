@@ -42,7 +42,10 @@ use std::{
 };
 
 use crate::{
-    graph::{Change, Connection, GraphId, ParameterChange, SimultaneousChanges},
+    graph::{
+        Change, Connection, EventChange, EventPayload, GraphId, ParameterChange,
+        SimultaneousChanges,
+    },
     prelude::{PowfGen, PowfHandle, SubGen},
     Sample,
 };
@@ -192,6 +195,15 @@ impl<A: Copy + HandleData> Handle<A> {
             changes.push(id.change().trigger(channel));
         }
         knyst_commands().schedule_changes(changes);
+        self
+    }
+    /// The non-typed way to send a block-local event to an event input.
+    pub fn event(self, channel: impl Into<NodeChannel>, payload: EventPayload) -> Handle<A> {
+        let channel = channel.into();
+        for id in self.node_ids() {
+            knyst_commands()
+                .schedule_event(EventChange::now(id.event_input(channel), payload.clone()));
+        }
         self
     }
     /// Sets the mortality for every referenced by the Handle

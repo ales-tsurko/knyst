@@ -144,6 +144,14 @@ impl NodeId {
             channel: channel.into(),
         }
     }
+    /// Create a [`NodeEventInput`] based on `self` and a specific event
+    /// channel.
+    pub fn event_input(&self, channel: impl Into<connection::NodeChannel>) -> NodeEventInput {
+        NodeEventInput {
+            node: *self,
+            channel: channel.into(),
+        }
+    }
 }
 
 impl NodeId {
@@ -219,6 +227,15 @@ pub struct SimultaneousChanges {
     pub time: Time,
     /// What changes to apply at the same time
     pub changes: Vec<NodeChanges>,
+}
+
+/// Address of one event input on a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeEventInput {
+    /// Target node.
+    pub node: NodeId,
+    /// Event channel on the node.
+    pub channel: NodeChannel,
 }
 impl SimultaneousChanges {
     /// Empty `Self` set to be scheduled as soon as possible
@@ -311,6 +328,30 @@ pub enum Change {
     Trigger,
 }
 
+/// Payload for a scheduled block-local event.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EventPayload {
+    /// Floating-point payload.
+    F32(Sample),
+    /// Unsigned integer payload.
+    U32(u32),
+    /// Signed integer payload.
+    I32(i32),
+    /// Opaque bytes payload.
+    Bytes(Box<[u8]>),
+}
+
+/// Event delivered to a node in the current block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockEvent {
+    /// Event input index on the node.
+    pub input: usize,
+    /// Sample offset in the current block.
+    pub sample_offset: usize,
+    /// Event payload.
+    pub payload: EventPayload,
+}
+
 impl From<f32> for Change {
     fn from(value: f32) -> Self {
         Self::Constant(value as Sample)
@@ -331,6 +372,56 @@ pub struct ParameterChange {
     pub input: NodeInput,
     /// New value of the input constant
     pub value: Change,
+}
+
+/// A scheduled block-local event change for a node.
+#[derive(Clone, Debug)]
+pub struct EventChange {
+    /// When to deliver the event.
+    pub time: Time,
+    /// Target event input.
+    pub input: NodeEventInput,
+    /// Event payload.
+    pub payload: EventPayload,
+}
+
+impl EventChange {
+    /// Schedule an event at a specific time in [`Beats`].
+    pub fn beats(input: NodeEventInput, payload: EventPayload, beats: Beats) -> Self {
+        Self {
+            input,
+            payload,
+            time: Time::Beats(beats),
+        }
+    }
+    /// Schedule an event at a specific time in [`Seconds`].
+    pub fn seconds(input: NodeEventInput, payload: EventPayload, seconds: Seconds) -> Self {
+        Self {
+            input,
+            payload,
+            time: Time::Seconds(seconds),
+        }
+    }
+    /// Schedule an event at a duration from right now.
+    pub fn duration_from_now(
+        input: NodeEventInput,
+        payload: EventPayload,
+        from_now: Duration,
+    ) -> Self {
+        Self {
+            input,
+            payload,
+            time: Time::DurationFromNow(from_now),
+        }
+    }
+    /// Schedule an event as soon as possible.
+    pub fn now(input: NodeEventInput, payload: EventPayload) -> Self {
+        Self {
+            input,
+            payload,
+            time: Time::Immediately,
+        }
+    }
 }
 
 impl ParameterChange {
@@ -531,6 +622,8 @@ struct Task {
     output_buffers_first_ptr: *mut Sample,
     block_size: usize,
     num_outputs: usize,
+    block_events: Vec<BlockEvent>,
+    partial_block_events: Vec<BlockEvent>,
     /// When a node is scheduled to start a certain sample this will hold that
     /// time in samples at the local Graph sample rate. Otherwise 0.
     start_node_at_sample: u64,
@@ -545,7 +638,7 @@ impl Task {
         }
     }
     #[inline]
-    fn apply_constant_change(&mut self, change: &ScheduledChange, start_sample_in_block: usize) {
+    fn apply_scheduled_change(&mut self, change: &ScheduledChange, start_sample_in_block: usize) {
         match change.kind {
             ScheduledChangeKind::Constant { index, value } => {
                 let node_constants = unsafe { &mut *self.input_constants };
@@ -556,6 +649,13 @@ impl Task {
             }
             ScheduledChangeKind::Trigger { index } => {
                 self.input_buffers.write(1.0, index, start_sample_in_block);
+            }
+            ScheduledChangeKind::Event { index, ref payload } => {
+                self.block_events.push(BlockEvent {
+                    input: index,
+                    sample_offset: start_sample_in_block,
+                    payload: payload.clone(),
+                });
             }
         }
     }
@@ -614,11 +714,14 @@ impl Task {
             let ctx = GenContext {
                 inputs: &self.input_buffers,
                 outputs: &mut outputs,
+                events: &self.block_events,
                 sample_rate,
                 transport,
             };
             assert!(!self.gen.is_null());
-            unsafe { (*self.gen).process(ctx, resources) }
+            let state = unsafe { (*self.gen).process(ctx, resources) };
+            self.block_events.clear();
+            state
         } else if ((self.start_node_at_sample - sample_time_at_block_start) as usize)
             < self.block_size
         {
@@ -635,19 +738,32 @@ impl Task {
             let partial_inputs =
                 unsafe { self.input_buffers.to_partial_block_size(new_block_size) };
             let mut partial_outputs = unsafe { outputs.to_partial_block_size(new_block_size) };
+            self.partial_block_events.clear();
+            let start_offset = (self.start_node_at_sample - sample_time_at_block_start) as usize;
+            for event in &self.block_events {
+                if event.sample_offset >= start_offset {
+                    self.partial_block_events.push(BlockEvent {
+                        input: event.input,
+                        sample_offset: event.sample_offset - start_offset,
+                        payload: event.payload.clone(),
+                    });
+                }
+            }
             let ctx = GenContext {
                 inputs: &partial_inputs,
                 outputs: &mut partial_outputs,
+                events: &self.partial_block_events,
                 sample_rate,
-                transport: transport.map(|transport| {
-                    transport
-                        .advanced((self.start_node_at_sample - sample_time_at_block_start) as usize)
-                }),
+                transport: transport.map(|transport| transport.advanced(start_offset)),
             };
             assert!(!self.gen.is_null());
-            unsafe { (*self.gen).process(ctx, resources) }
+            let state = unsafe { (*self.gen).process(ctx, resources) };
+            self.partial_block_events.clear();
+            self.block_events.clear();
+            state
         } else {
             // It's not time to run the node yet, just continue
+            self.block_events.clear();
             GenState::Continue
         }
     }
@@ -742,6 +858,8 @@ pub enum ScheduleError {
     NodeNotFound,
     #[error("The input label specified was not registered for the node: `{0}`")]
     InputLabelNotFound(&'static str),
+    #[error("The event input label specified was not registered for the node: `{0}`")]
+    EventInputLabelNotFound(&'static str),
     #[error(
         "No scheduler was created for the Graph so the change cannot be scheduled. This is likely because this Graph was not yet added to another Graph or split into a Node."
     )]
@@ -755,6 +873,12 @@ pub enum ScheduleError {
         node_name: String,
         channel: NodeChannel,
         change: Change,
+    },
+    #[error("Tried to schedule event `{payload:?}` to non existing event input `{channel:?}` for node `{node_name}`")]
+    EventInputOutOfRange {
+        node_name: String,
+        channel: NodeChannel,
+        payload: EventPayload,
     },
 }
 
@@ -1227,6 +1351,8 @@ pub struct Graph {
     node_input_edges: SecondaryMap<NodeKey, Vec<Edge>>,
     node_input_index_to_name: SecondaryMap<NodeKey, Vec<&'static str>>,
     node_input_name_to_index: SecondaryMap<NodeKey, HashMap<&'static str, usize>>,
+    node_event_input_index_to_name: SecondaryMap<NodeKey, Vec<&'static str>>,
+    node_event_input_name_to_index: SecondaryMap<NodeKey, HashMap<&'static str, usize>>,
     node_output_index_to_name: SecondaryMap<NodeKey, Vec<&'static str>>,
     node_output_name_to_index: SecondaryMap<NodeKey, HashMap<&'static str, usize>>,
     /// List of feedback input edges for every node. The NodeKey in the tuple is the index of the FeedbackNode doing the buffering
@@ -1302,6 +1428,8 @@ impl Graph {
             node_input_edges,
             node_input_index_to_name: SecondaryMap::with_capacity(num_nodes),
             node_input_name_to_index: SecondaryMap::with_capacity(num_nodes),
+            node_event_input_index_to_name: SecondaryMap::with_capacity(num_nodes),
+            node_event_input_name_to_index: SecondaryMap::with_capacity(num_nodes),
             node_output_index_to_name: SecondaryMap::with_capacity(num_nodes),
             node_output_name_to_index: SecondaryMap::with_capacity(num_nodes),
             node_feedback_node_key: SecondaryMap::with_capacity(num_nodes),
@@ -1641,6 +1769,12 @@ impl Graph {
             .enumerate()
             .map(|(i, &name)| (name, i))
             .collect();
+        let event_input_index_to_name = node.event_input_indices_to_names();
+        let event_input_name_to_index = event_input_index_to_name
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name, i))
+            .collect();
         let output_index_to_name = node.output_indices_to_names();
         let output_name_to_index = output_index_to_name
             .iter()
@@ -1660,6 +1794,10 @@ impl Graph {
             .insert(key, input_index_to_name);
         self.node_input_name_to_index
             .insert(key, input_name_to_index);
+        self.node_event_input_index_to_name
+            .insert(key, event_input_index_to_name);
+        self.node_event_input_name_to_index
+            .insert(key, event_input_name_to_index);
         self.node_output_index_to_name
             .insert(key, output_index_to_name);
         self.node_output_name_to_index
@@ -2316,6 +2454,68 @@ impl Graph {
                 }
             }
             return Err(ScheduleError::GraphNotFound(change.input.node));
+        }
+        Ok(())
+    }
+    /// Schedule a block-local event for a node event input.
+    pub fn schedule_event(&mut self, event: EventChange) -> Result<(), ScheduleError> {
+        let mut node_might_be_in_this_graph = true;
+        if event.input.node.graph_id() != self.id {
+            node_might_be_in_this_graph = false;
+        }
+        if node_might_be_in_this_graph {
+            if let Some(key) = Self::key_from_id(&self.node_ids, event.input.node) {
+                if !self.get_nodes_mut().contains_key(key) {
+                    return Err(ScheduleError::NodeNotFound);
+                }
+                let index = match event.input.channel {
+                    NodeChannel::Label(label) => {
+                        if let Some(label_index) =
+                            self.node_event_input_name_to_index[key].get(label)
+                        {
+                            *label_index
+                        } else {
+                            return Err(ScheduleError::EventInputLabelNotFound(label));
+                        }
+                    }
+                    NodeChannel::Index(i) => i,
+                };
+                if index >= self.node_event_input_index_to_name[key].len() {
+                    return Err(ScheduleError::EventInputOutOfRange {
+                        node_name: self.get_nodes()[key].name.to_string(),
+                        channel: event.input.channel,
+                        payload: event.payload,
+                    });
+                }
+                let change_kind = ScheduledChangeKind::Event {
+                    index,
+                    payload: event.payload,
+                };
+                if let Some(ggc) = &mut self.graph_gen_communicator {
+                    ggc.scheduler
+                        .schedule(vec![(key, change_kind, None)], event.time)?;
+                } else {
+                    self.scheduled_changes_queue
+                        .push((vec![(key, change_kind, None)], event.time));
+                }
+                return Ok(());
+            }
+        }
+        if !node_might_be_in_this_graph {
+            for (_key, graph) in &mut self.graphs_per_node {
+                match graph.schedule_event(event.clone()) {
+                    Ok(_) => {
+                        return Ok(());
+                    }
+                    Err(e) => match e {
+                        ScheduleError::GraphNotFound(_) => (),
+                        _ => {
+                            return Err(e);
+                        }
+                    },
+                }
+            }
+            return Err(ScheduleError::GraphNotFound(event.input.node));
         }
         Ok(())
     }
@@ -3876,7 +4076,7 @@ unsafe impl Send for Graph {}
 
 /// The internal representation of a scheduled change to a running graph. This
 /// is what gets sent to the `GraphGen`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ScheduledChange {
     /// timestamp in samples in the current Graph's sample rate
     timestamp: u64,
@@ -3887,14 +4087,15 @@ struct ScheduledChange {
     /// since the change first expired.
     removal_countdown: u8,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ScheduledChangeKind {
     Constant { index: usize, value: Sample },
     Trigger { index: usize },
+    Event { index: usize, payload: EventPayload },
 }
 
 /// Scheduled change in transport time domain.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PendingScheduledChange {
     /// Timestamp in transport samples.
     transport_timestamp: u64,
@@ -4310,7 +4511,7 @@ impl Scheduler {
 
                 let mut i = 0;
                 while i < scheduling_queue.len() {
-                    let pending = scheduling_queue[i];
+                    let pending = scheduling_queue[i].clone();
                     if current_transport >= pending.transport_timestamp
                         || pending.transport_timestamp - current_transport < *max_duration_to_send
                     {

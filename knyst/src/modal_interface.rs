@@ -16,8 +16,8 @@ use crate::controller::{
 };
 use crate::graph::connection::{ConnectionBundle, InputBundle};
 use crate::graph::{
-    Connection, GenOrGraph, GraphId, GraphSettings, NodeId, ObservabilitySnapshot, ParameterChange,
-    SimultaneousChanges, Time, TransportSnapshot,
+    Connection, EventChange, GenOrGraph, GraphId, GraphSettings, NodeId, ObservabilitySnapshot,
+    ParameterChange, SimultaneousChanges, Time, TransportSnapshot,
 };
 use crate::handles::{GraphHandle, Handle};
 use crate::inspection::GraphInspection;
@@ -117,6 +117,10 @@ impl KnystCommands for SharedKnystCommands {
 
     fn schedule_change(&mut self, change: ParameterChange) {
         self.lock().schedule_change(change);
+    }
+
+    fn schedule_event(&mut self, event: EventChange) {
+        self.lock().schedule_event(event);
     }
 
     fn clear_scheduled_changes(&mut self) {

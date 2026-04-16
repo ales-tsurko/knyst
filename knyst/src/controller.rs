@@ -16,7 +16,9 @@ use std::{
 
 use crate::{
     buffer::Buffer,
-    graph::{NodeChanges, ObservabilitySnapshot, ScheduleError, Time, TransportSnapshot},
+    graph::{
+        EventChange, NodeChanges, ObservabilitySnapshot, ScheduleError, Time, TransportSnapshot,
+    },
     inspection::GraphInspection,
     knyst_commands,
     resources::{BufferId, ResourcesCommand, ResourcesResponse, WavetableId},
@@ -55,6 +57,7 @@ enum Command {
     FreeNode(NodeId),
     FreeNodeMendConnections(NodeId),
     ScheduleChange(ParameterChange),
+    ScheduleEvent(EventChange),
     ScheduleChanges(SimultaneousChanges),
     ClearScheduledChanges,
     FreeDisconnectedNodes,
@@ -94,6 +97,7 @@ impl std::fmt::Debug for Command {
                 .field(arg0)
                 .finish(),
             Self::ScheduleChange(arg0) => f.debug_tuple("ScheduleChange").field(arg0).finish(),
+            Self::ScheduleEvent(arg0) => f.debug_tuple("ScheduleEvent").field(arg0).finish(),
             Self::ScheduleChanges(arg0) => f.debug_tuple("ScheduleChanges").field(arg0).finish(),
             Self::ClearScheduledChanges => write!(f, "ClearScheduledChanges"),
             Self::FreeDisconnectedNodes => write!(f, "FreeDisconnectedNodes"),
@@ -206,6 +210,8 @@ pub trait KnystCommands {
     /// [`KnystCommands`] through `AudioBackend::start_processing` this is taken
     /// care of automatically.
     fn schedule_change(&mut self, change: ParameterChange);
+    /// Schedule a block-local event to be delivered to a node.
+    fn schedule_event(&mut self, event: EventChange);
     /// Schedule multiple changes to be made.
     ///
     /// NB: Changes are buffered and the scheduler needs to be regularly updated
@@ -545,6 +551,17 @@ impl KnystCommands for MultiThreadedKnystCommands {
                 }
             });
         }
+    }
+    fn schedule_event(&mut self, event: EventChange) {
+        LOCAL_GRAPH.with_borrow_mut(|g| {
+            if let Some(g) = g.last_mut() {
+                if let Err(e) = g.schedule_event(event.clone()) {
+                    self.report_error(e);
+                }
+            } else if let Err(error) = self.send_command(Command::ScheduleEvent(event)) {
+                self.report_error(error);
+            }
+        });
     }
     /// Schedule multiple changes to be made.
     ///
@@ -1048,6 +1065,10 @@ impl Controller {
             Command::ScheduleChange(change) => self
                 .top_level_graph
                 .schedule_change(change)
+                .map_err(From::from),
+            Command::ScheduleEvent(event) => self
+                .top_level_graph
+                .schedule_event(event)
                 .map_err(From::from),
             Command::FreeDisconnectedNodes => self
                 .top_level_graph
@@ -1607,6 +1628,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             commands.free_disconnected_nodes();
             commands.free_node(NodeId::new(graph_id));
+            commands.schedule_event(EventChange::now(
+                NodeId::new(graph_id).event_input(0),
+                crate::graph::EventPayload::U32(1),
+            ));
             commands.clear_scheduled_changes();
             commands.change_musical_time_map(|_| {});
             let _ = commands.request_inspection();

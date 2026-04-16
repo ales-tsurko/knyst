@@ -71,6 +71,8 @@ impl Node {
             output_buffers_first_ptr: self.output_buffers_first_ptr,
             block_size: self.block_size,
             num_outputs: self.num_outputs,
+            block_events: Vec::new(),
+            partial_block_events: Vec::new(),
             start_node_at_sample: self.start_node_at_sample,
         }
     }
@@ -116,6 +118,7 @@ impl Node {
         let ctx = GenContext {
             inputs: input_buffers,
             outputs: &mut outputs,
+            events: &[],
             sample_rate,
             transport,
         };
@@ -145,6 +148,14 @@ impl Node {
         let mut list = vec![];
         for i in 0..self.num_inputs() {
             list.push(unsafe { (*self.gen).input_desc(i) });
+        }
+        list
+    }
+    pub fn event_input_indices_to_names(&self) -> Vec<&'static str> {
+        let mut list = vec![];
+        let num_event_inputs = unsafe { (*self.gen).num_event_inputs() };
+        for i in 0..num_event_inputs {
+            list.push(unsafe { (*self.gen).event_input_desc(i) });
         }
         list
     }

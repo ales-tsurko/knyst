@@ -43,6 +43,43 @@ impl ValueGen {
         GenState::Continue
     }
 }
+
+struct EventEchoGen;
+
+impl Gen for EventEchoGen {
+    fn process(&mut self, ctx: GenContext, _resources: &mut Resources) -> GenState {
+        ctx.outputs.fill_channel(0.0, 0);
+        for event in ctx.events {
+            if let EventPayload::F32(value) = event.payload {
+                ctx.outputs.write(value, 0, event.sample_offset);
+            }
+        }
+        GenState::Continue
+    }
+
+    fn num_inputs(&self) -> usize {
+        0
+    }
+
+    fn num_outputs(&self) -> usize {
+        1
+    }
+
+    fn num_event_inputs(&self) -> usize {
+        1
+    }
+
+    fn event_input_desc(&self, input: usize) -> &'static str {
+        match input {
+            0 => "event",
+            _ => "",
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "EventEchoGen"
+    }
+}
 #[impl_gen]
 impl DummyGen {
     fn new(counter_start: Sample) -> Self {
@@ -78,6 +115,51 @@ fn create_graph() {
     let mut run_graph = test_run_graph(&mut graph, RunGraphSettings::default());
     run_graph.process_block();
     assert_eq!(run_graph.graph_output_buffers().read(0, 31), 32.0);
+}
+
+#[test]
+fn scheduled_events_are_delivered_at_block_sample_offsets() {
+    let mut graph = Graph::new(GraphSettings {
+        block_size: 8,
+        num_outputs: 1,
+        sample_rate: 8.0,
+        ..GraphSettings::default()
+    });
+    let node_id = graph.push(EventEchoGen);
+    graph.connect(Connection::graph_output(node_id)).unwrap();
+    graph
+        .schedule_event(EventChange::seconds(
+            node_id.event_input("event"),
+            EventPayload::F32(1.0),
+            Seconds::from_seconds_f64(0.25),
+        ))
+        .unwrap();
+    graph
+        .schedule_event(EventChange::seconds(
+            node_id.event_input("event"),
+            EventPayload::F32(2.0),
+            Seconds::from_seconds_f64(0.625),
+        ))
+        .unwrap();
+
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..RunGraphSettings::default()
+        },
+    );
+    run_graph.process_block();
+
+    let output = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(output[0], 0.0);
+    assert_eq!(output[1], 0.0);
+    assert_eq!(output[2], 1.0);
+    assert_eq!(output[3], 0.0);
+    assert_eq!(output[4], 0.0);
+    assert_eq!(output[5], 2.0);
+    assert_eq!(output[6], 0.0);
+    assert_eq!(output[7], 0.0);
 }
 #[test]
 fn multiple_nodes() {

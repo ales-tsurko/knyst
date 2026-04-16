@@ -667,7 +667,7 @@ impl Gen for GraphGen {
                                 change.timestamp - self.sample_counter
                             } as usize;
                             if sample_to_apply < self.block_size {
-                                task.apply_constant_change(change, sample_to_apply);
+                                task.apply_scheduled_change(change, sample_to_apply);
                                 // TODO: This is inefficient since the the first
                                 // changes are the most likely to be removed,
                                 // and are the most expensive to remove. Either
