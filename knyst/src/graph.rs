@@ -3329,6 +3329,17 @@ impl Graph {
         }
     }
 
+    /// Clear pending scheduled changes that have not yet been transferred to the audio thread.
+    pub fn clear_scheduled_changes(&mut self) -> Result<(), ScheduleError> {
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.scheduler.clear_pending_changes();
+            Ok(())
+        } else {
+            self.scheduled_changes_queue.clear();
+            Ok(())
+        }
+    }
+
     /// Query current transport state and position.
     #[must_use]
     pub fn transport_snapshot(&self) -> Option<TransportSnapshot> {
@@ -4156,6 +4167,15 @@ impl Scheduler {
             }
         };
         self.seek_seconds(seconds)
+    }
+
+    fn clear_pending_changes(&mut self) {
+        match self {
+            Scheduler::Stopped { scheduling_queue } => scheduling_queue.clear(),
+            Scheduler::Running {
+                scheduling_queue, ..
+            } => scheduling_queue.clear(),
+        }
     }
 
     fn transport_snapshot(&self) -> Option<TransportSnapshot> {

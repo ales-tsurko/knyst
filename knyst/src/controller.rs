@@ -56,6 +56,7 @@ enum Command {
     FreeNodeMendConnections(NodeId),
     ScheduleChange(ParameterChange),
     ScheduleChanges(SimultaneousChanges),
+    ClearScheduledChanges,
     FreeDisconnectedNodes,
     ResourcesCommand(ResourcesCommand),
     ChangeMusicalTimeMap(Box<dyn FnOnce(&mut MusicalTimeMap) + Send>),
@@ -94,6 +95,7 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Self::ScheduleChange(arg0) => f.debug_tuple("ScheduleChange").field(arg0).finish(),
             Self::ScheduleChanges(arg0) => f.debug_tuple("ScheduleChanges").field(arg0).finish(),
+            Self::ClearScheduledChanges => write!(f, "ClearScheduledChanges"),
             Self::FreeDisconnectedNodes => write!(f, "FreeDisconnectedNodes"),
             Self::ResourcesCommand(_arg0) => f.debug_tuple("ResourcesCommand").finish(),
             Self::ChangeMusicalTimeMap(_arg0) => f.debug_tuple("ChangeMusicalTimeMap").finish(),
@@ -211,6 +213,8 @@ pub trait KnystCommands {
     /// [`KnystCommands`] through `AudioBackend::start_processing` this is taken
     /// care of automatically.
     fn schedule_changes(&mut self, changes: SimultaneousChanges);
+    /// Clear any pending scheduled changes that have not yet been sent to the audio thread.
+    fn clear_scheduled_changes(&mut self);
     /// Inserts a new buffer in the [`Resources`] and returns an id which can be
     /// converted to a key on the audio thread with access to a [`Resources`].
     fn insert_buffer(&mut self, buffer: Buffer) -> BufferId;
@@ -590,6 +594,23 @@ impl KnystCommands for MultiThreadedKnystCommands {
                         }
                     }
                 });
+            }
+        }
+    }
+    fn clear_scheduled_changes(&mut self) {
+        let found_in_local = LOCAL_GRAPH.with_borrow_mut(|g| {
+            if let Some(g) = g.last_mut() {
+                if let Err(error) = g.clear_scheduled_changes() {
+                    self.report_error(error);
+                }
+                true
+            } else {
+                false
+            }
+        });
+        if !found_in_local {
+            if let Err(error) = self.send_command(Command::ClearScheduledChanges) {
+                self.report_error(error);
             }
         }
     }
@@ -1067,6 +1088,10 @@ impl Controller {
                     },
                 }
             }
+            Command::ClearScheduledChanges => self
+                .top_level_graph
+                .clear_scheduled_changes()
+                .map_err(From::from),
             Command::ScheduleBeatCallback(mut callback, start_beat) => {
                 // Find the start beat
                 let current_beats = self.top_level_graph.get_current_time_musical().unwrap();
@@ -1582,6 +1607,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             commands.free_disconnected_nodes();
             commands.free_node(NodeId::new(graph_id));
+            commands.clear_scheduled_changes();
             commands.change_musical_time_map(|_| {});
             let _ = commands.request_inspection();
             commands.transport_play();

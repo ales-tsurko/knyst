@@ -119,6 +119,10 @@ impl KnystCommands for SharedKnystCommands {
         self.lock().schedule_change(change);
     }
 
+    fn clear_scheduled_changes(&mut self) {
+        self.lock().clear_scheduled_changes();
+    }
+
     fn schedule_changes(&mut self, changes: SimultaneousChanges) {
         self.lock().schedule_changes(changes);
     }

@@ -179,7 +179,7 @@ mod jack_backend {
             // Create client
             let (client, _status) =
                 jack::Client::new(name.as_ref(), jack::ClientOptions::NO_START_SERVER)?;
-            let sample_rate = client.sample_rate();
+            let sample_rate = client.sample_rate() as usize;
             let block_size = client.buffer_size() as usize;
             Ok(Self {
                 client: Some(JackClient::Passive(client)),

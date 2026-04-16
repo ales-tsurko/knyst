@@ -1557,6 +1557,70 @@ fn transport_seek_forward_drops_dense_future_queue() {
 }
 
 #[test]
+fn clear_scheduled_changes_drops_dense_future_queue() {
+    let sample_rate = 100;
+    let block_size = 10;
+    let mut graph = Graph::new(GraphSettings {
+        sample_rate: sample_rate as Sample,
+        block_size,
+        num_outputs: 1,
+        ..Default::default()
+    });
+    let node = graph.push(ValueGen);
+    graph
+        .connect(constant(0.0).to(node).to_label("value"))
+        .expect("connection should succeed");
+    graph
+        .connect(node.to_graph_out())
+        .expect("connection should succeed");
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+
+    graph
+        .transport_pause()
+        .expect("transport pause should succeed");
+    for i in 1..=64 {
+        graph
+            .schedule_change(ParameterChange::duration_from_now(
+                node.input("value"),
+                i as f32,
+                Duration::from_millis((i * 20) as u64),
+            ))
+            .expect("scheduling dense queue should succeed");
+    }
+    graph
+        .clear_scheduled_changes()
+        .expect("clearing scheduled changes should succeed");
+    graph
+        .transport_play()
+        .expect("transport play should succeed");
+
+    for _ in 0..8 {
+        graph.update();
+        run_graph.process_block();
+        assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 0.0);
+    }
+
+    graph
+        .schedule_change(ParameterChange::duration_from_now(
+            node.input("value"),
+            3.0,
+            Duration::from_millis(100),
+        ))
+        .expect("schedule after clear should succeed");
+    graph.update();
+    run_graph.process_block();
+    graph.update();
+    run_graph.process_block();
+    assert_eq!(run_graph.graph_output_buffers().get_channel(0)[0], 3.0);
+}
+
+#[test]
 fn transport_play_pause_seek_stress_does_not_break_snapshot() {
     let sample_rate = 100;
     let block_size = 5;
