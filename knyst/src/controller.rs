@@ -35,6 +35,7 @@ use crate::{
     time::Beats,
     KnystError,
 };
+use audio_thread_priority::promote_current_thread_to_real_time;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 /// Encodes commands sent from a [`KnystCommands`]
@@ -1234,13 +1235,21 @@ impl Controller {
     pub fn start_on_new_thread(self) -> MultiThreadedKnystCommands {
         let top_level_graph_id = self.top_level_graph.id();
         let top_level_graph_settings = self.top_level_graph.graph_settings();
+        let controller_block_size = top_level_graph_settings.block_size as u32;
+        let controller_sample_rate = top_level_graph_settings.sample_rate.round() as u32;
         let mut controller = self;
         let sender = controller.command_sender.clone();
 
-        std::thread::spawn(move || loop {
-            while !controller.run(300) {}
-            std::thread::sleep(Duration::from_micros(1));
-        });
+        std::thread::Builder::new()
+            .name("knyst-controller".to_string())
+            .spawn(move || {
+                elevate_controller_thread_priority(controller_block_size, controller_sample_rate);
+                loop {
+                    while !controller.run(300) {}
+                    std::thread::sleep(Duration::from_micros(1));
+                }
+            })
+            .expect("failed to spawn knyst controller thread");
 
         MultiThreadedKnystCommands {
             sender,
@@ -1251,6 +1260,16 @@ impl Controller {
             changes_bundle: vec![],
             changes_bundle_time: Time::Immediately,
         }
+    }
+}
+
+fn elevate_controller_thread_priority(block_size: u32, sample_rate: u32) {
+    if block_size == 0 || sample_rate == 0 {
+        return;
+    }
+
+    if let Err(error) = promote_current_thread_to_real_time(block_size, sample_rate) {
+        eprintln!("Knyst controller thread priority promotion failed: {error}");
     }
 }
 
