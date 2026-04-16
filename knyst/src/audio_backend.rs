@@ -534,6 +534,80 @@ pub mod cpal_backend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn process_output_block<T>(
+        output: &mut [T],
+        channels: usize,
+        run_graph: &mut RunGraph,
+        graph_block_size: usize,
+        sample_counter: &mut usize,
+        graph_input_channels: usize,
+        input_consumer: &mut Option<rtrb::Consumer<Sample>>,
+        underflow_reporter: &mut CallbackIssueReporter,
+        underflow_report: &mut Option<usize>,
+    ) where
+        T: cpal::Sample + cpal::FromSample<Sample> + cpal::SizedSample,
+    {
+        for frame in output.chunks_mut(channels) {
+            if *sample_counter >= graph_block_size {
+                run_graph.run_resources_communication(50);
+                run_graph.process_block();
+                *sample_counter = 0;
+            }
+            if graph_input_channels > 0 {
+                let graph_input_buffers = run_graph.graph_input_buffers();
+                let mut missing_samples = 0_u64;
+                for channel_i in 0..graph_input_channels {
+                    let value = input_consumer
+                        .as_mut()
+                        .and_then(|consumer| consumer.pop().ok());
+                    let value = if let Some(value) = value {
+                        value
+                    } else {
+                        missing_samples += 1;
+                        0.0
+                    };
+                    graph_input_buffers.write(value, channel_i, *sample_counter);
+                }
+                if let Some(missing_samples) = underflow_reporter.record_issue(missing_samples) {
+                    *underflow_report = Some(missing_samples);
+                }
+            }
+            {
+                let buffer = run_graph.graph_output_buffers();
+                for (channel_i, out) in frame.iter_mut().enumerate() {
+                    let value: T = T::from_sample(buffer.read(channel_i, *sample_counter));
+                    *out = value;
+                }
+            }
+            *sample_counter += 1;
+        }
+    }
+
+    fn process_input_block<T>(
+        input: &[T],
+        input_channels: usize,
+        input_producer: &mut rtrb::Producer<Sample>,
+        overflow_reporter: &mut CallbackIssueReporter,
+        overflow_report: &mut Option<usize>,
+    ) where
+        T: cpal::Sample + cpal::SizedSample,
+        Sample: cpal::FromSample<T>,
+    {
+        let mut dropped_samples = 0_u64;
+        for frame in input.chunks(input_channels) {
+            for sample in frame {
+                let value = <Sample as CpalSampleTrait>::from_sample(*sample);
+                if input_producer.push(value).is_err() {
+                    dropped_samples += 1;
+                }
+            }
+        }
+        if let Some(dropped_samples) = overflow_reporter.record_issue(dropped_samples) {
+            *overflow_report = Some(dropped_samples);
+        }
+    }
+
     #[allow(missing_docs)]
     pub struct CpalBackendOptions {
         pub device: String,
@@ -918,44 +992,33 @@ pub mod cpal_backend {
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let mut underflow_report = None;
+                #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
                 let process = || {
-                    for frame in output.chunks_mut(channels) {
-                        if sample_counter >= graph_block_size {
-                            run_graph.run_resources_communication(50);
-                            run_graph.process_block();
-                            sample_counter = 0;
-                        }
-                        if graph_input_channels > 0 {
-                            let graph_input_buffers = run_graph.graph_input_buffers();
-                            let mut missing_samples = 0_u64;
-                            for channel_i in 0..graph_input_channels {
-                                let value = input_consumer
-                                    .as_mut()
-                                    .and_then(|consumer| consumer.pop().ok());
-                                let value = if let Some(value) = value {
-                                    value
-                                } else {
-                                    missing_samples += 1;
-                                    0.0
-                                };
-                                graph_input_buffers.write(value, channel_i, sample_counter);
-                            }
-                            if let Some(missing_samples) =
-                                underflow_reporter.record_issue(missing_samples)
-                            {
-                                underflow_report = Some(missing_samples);
-                            }
-                        }
-                        {
-                            let buffer = run_graph.graph_output_buffers();
-                            for (channel_i, out) in frame.iter_mut().enumerate() {
-                                let value: T =
-                                    T::from_sample(buffer.read(channel_i, sample_counter));
-                                *out = value;
-                            }
-                        }
-                        sample_counter += 1;
-                    }
+                    process_output_block(
+                        output,
+                        channels,
+                        &mut run_graph,
+                        graph_block_size,
+                        &mut sample_counter,
+                        graph_input_channels,
+                        &mut input_consumer,
+                        &mut underflow_reporter,
+                        &mut underflow_report,
+                    );
+                };
+                #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
+                let mut process = || {
+                    process_output_block(
+                        output,
+                        channels,
+                        &mut run_graph,
+                        graph_block_size,
+                        &mut sample_counter,
+                        graph_input_channels,
+                        &mut input_consumer,
+                        &mut underflow_reporter,
+                        &mut underflow_report,
+                    );
                 };
                 #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
                 assert_no_alloc(process);
@@ -995,19 +1058,25 @@ pub mod cpal_backend {
             config,
             move |input: &[T], _: &cpal::InputCallbackInfo| {
                 let mut overflow_report = None;
+                #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
                 let process = || {
-                    let mut dropped_samples = 0_u64;
-                    for frame in input.chunks(input_channels) {
-                        for sample in frame {
-                            let value = <Sample as CpalSampleTrait>::from_sample(*sample);
-                            if input_producer.push(value).is_err() {
-                                dropped_samples += 1;
-                            }
-                        }
-                    }
-                    if let Some(dropped_samples) = overflow_reporter.record_issue(dropped_samples) {
-                        overflow_report = Some(dropped_samples);
-                    }
+                    process_input_block(
+                        input,
+                        input_channels,
+                        &mut input_producer,
+                        &mut overflow_reporter,
+                        &mut overflow_report,
+                    );
+                };
+                #[cfg(not(all(debug_assertions, feature = "assert_no_alloc")))]
+                let mut process = || {
+                    process_input_block(
+                        input,
+                        input_channels,
+                        &mut input_producer,
+                        &mut overflow_reporter,
+                        &mut overflow_report,
+                    );
                 };
                 #[cfg(all(debug_assertions, feature = "assert_no_alloc"))]
                 assert_no_alloc(process);
