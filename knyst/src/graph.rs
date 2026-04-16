@@ -3997,8 +3997,19 @@ impl Graph {
         let (scheduled_change_producer, rb_consumer) = RingBuffer::new(scheduler_buffer_size);
         let (clock_update_producer, clock_update_consumer) = RingBuffer::new(10);
         let (transport_update_producer, transport_update_consumer) = RingBuffer::new(10);
+        let schedule_generation = match &scheduler {
+            Scheduler::Stopped {
+                schedule_generation,
+                ..
+            }
+            | Scheduler::Running {
+                schedule_generation,
+                ..
+            } => schedule_generation.clone(),
+        };
         let schedule_receiver = ScheduleReceiver::new(
             rb_consumer,
+            schedule_generation.clone(),
             clock_update_consumer,
             transport_update_consumer,
             scheduler_buffer_size,
@@ -4212,6 +4223,7 @@ unsafe impl Send for Graph {}
 struct ScheduledChange {
     /// timestamp in samples in the current Graph's sample rate
     timestamp: u64,
+    generation: u64,
     key: NodeKey,
     kind: ScheduledChangeKind,
     /// If a change is unable to be applied on the audio thread for many
@@ -4231,6 +4243,7 @@ enum ScheduledChangeKind {
 struct PendingScheduledChange {
     /// Timestamp in transport samples.
     transport_timestamp: u64,
+    generation: u64,
     key: NodeKey,
     kind: ScheduledChangeKind,
     /// If a change is unable to be applied on the audio thread for many
@@ -4254,6 +4267,7 @@ type SchedulingQueueItem = (
 enum Scheduler {
     Stopped {
         scheduling_queue: Vec<SchedulingQueueItem>,
+        schedule_generation: Arc<AtomicU64>,
     },
     Running {
         /// Sample rate including oversampling
@@ -4265,6 +4279,7 @@ enum Scheduler {
         latency_in_samples: u64,
         musical_time_map: Arc<RwLock<MusicalTimeMap>>,
         engine_timestamp: Arc<AtomicU64>,
+        schedule_generation: Arc<AtomicU64>,
         transport: TransportClock,
     },
 }
@@ -4319,6 +4334,7 @@ impl Scheduler {
     fn new() -> Self {
         Scheduler::Stopped {
             scheduling_queue: vec![],
+            schedule_generation: Arc::new(AtomicU64::new(0)),
         }
     }
     fn start(
@@ -4332,6 +4348,7 @@ impl Scheduler {
         match self {
             Scheduler::Stopped {
                 ref mut scheduling_queue,
+                schedule_generation,
             } => {
                 // "Take" the scheduling queue out, replacing it with an empty vec which should be cheap
                 let scheduling_queue = mem::take(scheduling_queue);
@@ -4350,6 +4367,7 @@ impl Scheduler {
                     latency_in_samples: (latency.as_secs_f64() * (sample_rate as f64)) as u64,
                     musical_time_map,
                     engine_timestamp,
+                    schedule_generation: schedule_generation.clone(),
                     transport,
                 };
                 for (changes, time) in scheduling_queue {
@@ -4504,10 +4522,21 @@ impl Scheduler {
 
     fn clear_pending_changes(&mut self) {
         match self {
-            Scheduler::Stopped { scheduling_queue } => scheduling_queue.clear(),
+            Scheduler::Stopped {
+                scheduling_queue,
+                schedule_generation,
+            } => {
+                scheduling_queue.clear();
+                schedule_generation.fetch_add(1, Ordering::SeqCst);
+            }
             Scheduler::Running {
-                scheduling_queue, ..
-            } => scheduling_queue.clear(),
+                scheduling_queue,
+                schedule_generation,
+                ..
+            } => {
+                scheduling_queue.clear();
+                schedule_generation.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -4563,7 +4592,9 @@ impl Scheduler {
     ) -> Result<(), ScheduleError> {
         let timestamp = self.time_to_transport_timestamp(time)?;
         match self {
-            Scheduler::Stopped { scheduling_queue } => {
+            Scheduler::Stopped {
+                scheduling_queue, ..
+            } => {
                 scheduling_queue.push((changes, time));
                 Ok(())
             }
@@ -4571,6 +4602,7 @@ impl Scheduler {
                 sample_rate,
                 max_duration_to_send: _,
                 scheduling_queue,
+                schedule_generation,
                 ..
             } => {
                 // timestamp will be Some if the Scheduler is running
@@ -4592,6 +4624,7 @@ impl Scheduler {
                     }
                     scheduling_queue.push(PendingScheduledChange {
                         transport_timestamp: ts,
+                        generation: schedule_generation.load(Ordering::SeqCst),
                         key,
                         kind: change_kind,
                         removal_countdown: 0,
@@ -4655,6 +4688,7 @@ impl Scheduler {
                             };
                         let push_result = rb_producer.push(ScheduledChange {
                             timestamp: target_engine_timestamp,
+                            generation: pending.generation,
                             key: pending.key,
                             kind: pending.kind,
                             removal_countdown: pending.removal_countdown,
@@ -4693,12 +4727,15 @@ struct TransportUpdate {
 struct ScheduleReceiver {
     rb_consumer: rtrb::Consumer<ScheduledChange>,
     schedule_queue: Vec<ScheduledChange>,
+    schedule_generation: Arc<AtomicU64>,
+    seen_generation: u64,
     clock_update_consumer: rtrb::Consumer<ClockUpdate>,
     transport_update_consumer: rtrb::Consumer<TransportUpdate>,
 }
 impl ScheduleReceiver {
     fn new(
         rb_consumer: rtrb::Consumer<ScheduledChange>,
+        schedule_generation: Arc<AtomicU64>,
         clock_update_consumer: rtrb::Consumer<ClockUpdate>,
         transport_update_consumer: rtrb::Consumer<TransportUpdate>,
         capacity: usize,
@@ -4706,6 +4743,8 @@ impl ScheduleReceiver {
         Self {
             rb_consumer,
             schedule_queue: Vec::with_capacity(capacity),
+            seen_generation: schedule_generation.load(Ordering::SeqCst),
+            schedule_generation,
             clock_update_consumer,
             transport_update_consumer,
         }
@@ -4752,6 +4791,11 @@ impl ScheduleReceiver {
     }
     /// TODO: Return only a slice of changes that should be applied this block and then remove them all at once.
     fn changes(&mut self) -> &mut Vec<ScheduledChange> {
+        let generation = self.schedule_generation.load(Ordering::SeqCst);
+        if generation != self.seen_generation {
+            self.seen_generation = generation;
+            self.schedule_queue.clear();
+        }
         let num_new_changes = self.rb_consumer.slots();
         if num_new_changes > 0 {
             // Only try to read so many changes there is room for in the queue
@@ -4763,7 +4807,9 @@ impl ScheduleReceiver {
             match self.rb_consumer.read_chunk(changes_to_read) {
                 Ok(chunk) => {
                     for change in chunk {
-                        self.schedule_queue.push(change);
+                        if change.generation == self.seen_generation {
+                            self.schedule_queue.push(change);
+                        }
                     }
 
                     self.schedule_queue.sort_unstable_by_key(|s| s.timestamp);
