@@ -188,6 +188,10 @@ impl KnystCommands for SharedKnystCommands {
         self.lock().request_transport_snapshot()
     }
 
+    fn current_transport_snapshot(&self) -> Option<TransportSnapshot> {
+        self.lock().current_transport_snapshot()
+    }
+
     fn request_observability_snapshot(
         &mut self,
     ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>> {

@@ -55,8 +55,8 @@ use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
 use self::connection::{ConnectionBundle, NodeChannel, NodeInput, NodeOutput};
@@ -495,6 +495,86 @@ pub struct TransportSnapshot {
     pub seconds: Seconds,
     /// Position in beats, if the tempo map can be read.
     pub beats: Option<Beats>,
+}
+
+#[derive(Default)]
+pub(crate) struct SharedTransportSnapshotState {
+    available: AtomicBool,
+    state: AtomicU8,
+    anchor_engine_samples: AtomicU64,
+    anchor_transport_samples: AtomicU64,
+    sample_rate: AtomicU64,
+    engine_timestamp: OnceLock<Arc<AtomicU64>>,
+    musical_time_map: OnceLock<Arc<RwLock<MusicalTimeMap>>>,
+}
+
+impl SharedTransportSnapshotState {
+    pub(crate) fn initialize(
+        &self,
+        sample_rate: u64,
+        engine_timestamp: Arc<AtomicU64>,
+        musical_time_map: Arc<RwLock<MusicalTimeMap>>,
+    ) {
+        let _ = self.engine_timestamp.set(engine_timestamp);
+        let _ = self.musical_time_map.set(musical_time_map);
+        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+    }
+
+    fn update_transport(&self, sample_rate: u64, transport: TransportClock) {
+        self.available.store(true, Ordering::SeqCst);
+        self.state
+            .store(transport_state_to_u8(transport.state), Ordering::SeqCst);
+        self.anchor_engine_samples
+            .store(transport.anchor_engine_samples, Ordering::SeqCst);
+        self.anchor_transport_samples
+            .store(transport.anchor_transport_samples, Ordering::SeqCst);
+        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<TransportSnapshot> {
+        if !self.available.load(Ordering::SeqCst) {
+            return None;
+        }
+        let engine_timestamp = self.engine_timestamp.get()?;
+        let sample_rate = self.sample_rate.load(Ordering::SeqCst);
+        if sample_rate == 0 {
+            return None;
+        }
+        let state = transport_state_from_u8(self.state.load(Ordering::SeqCst));
+        let anchor_engine_samples = self.anchor_engine_samples.load(Ordering::SeqCst);
+        let anchor_transport_samples = self.anchor_transport_samples.load(Ordering::SeqCst);
+        let engine_now = engine_timestamp.load(Ordering::SeqCst);
+        let samples = match state {
+            TransportState::Playing => anchor_transport_samples
+                .saturating_add(engine_now.saturating_sub(anchor_engine_samples)),
+            TransportState::Paused => anchor_transport_samples,
+        };
+        let seconds = Seconds::from_samples(samples, sample_rate);
+        let beats = self
+            .musical_time_map
+            .get()
+            .and_then(|map| map.read().ok().map(|map| map.seconds_to_beats(seconds)));
+        Some(TransportSnapshot {
+            state,
+            samples,
+            seconds,
+            beats,
+        })
+    }
+}
+
+fn transport_state_to_u8(state: TransportState) -> u8 {
+    match state {
+        TransportState::Playing => 1,
+        TransportState::Paused => 0,
+    }
+}
+
+fn transport_state_from_u8(value: u8) -> TransportState {
+    match value {
+        1 => TransportState::Playing,
+        _ => TransportState::Paused,
+    }
 }
 
 /// Snapshot of runtime observability metrics.
@@ -1388,6 +1468,7 @@ pub struct Graph {
     inputs_buffers_ptr: Arc<OwnedRawBuffer>,
     max_node_inputs: usize,
     graph_gen_communicator: Option<GraphGenCommunicator>,
+    shared_transport_snapshot: Arc<SharedTransportSnapshotState>,
     /// For storing changes made before the graph is started. When the GraphGen is created, the changes will be scheduled on the scheduler.
     scheduled_changes_queue: Vec<QueuedScheduledChanges>,
 }
@@ -1454,12 +1535,17 @@ impl Graph {
             max_node_inputs,
             ring_buffer_size,
             graph_gen_communicator: None,
+            shared_transport_snapshot: Arc::new(SharedTransportSnapshotState::default()),
             recalculation_required: false,
             buffers_to_free_when_safe: vec![],
             new_inputs_buffers_ptr: false,
             graph_input_to_output_edges,
             scheduled_changes_queue: vec![],
         }
+    }
+
+    pub(crate) fn shared_transport_snapshot(&self) -> Arc<SharedTransportSnapshotState> {
+        self.shared_transport_snapshot.clone()
     }
     /// Create a node that will run this graph. This will fail if a Node or Gen has already been created from the Graph since only one Gen is allowed to exist per Graph.
     ///
@@ -2148,6 +2234,13 @@ impl Graph {
             if let Some(clock_update) = &clock_update {
                 ggc.send_clock_update(clock_update.clone()); // Make sure all the clocks in the GraphGens are in sync.
             }
+            let graph_sample_rate =
+                (self.sample_rate * (self.oversampling.as_usize() as Sample)) as u64;
+            self.shared_transport_snapshot.initialize(
+                graph_sample_rate,
+                ggc.timestamp.clone(),
+                musical_time_map.clone(),
+            );
             ggc.scheduler.start(
                 self.sample_rate * (self.oversampling.as_usize() as Sample),
                 self.block_size * self.oversampling.as_usize(),
@@ -2156,7 +2249,15 @@ impl Graph {
                 musical_time_map.clone(),
             );
             if let Some(transport_update) = ggc.scheduler.transport_update() {
-                ggc.send_transport_update(transport_update);
+                ggc.send_transport_update(transport_update.clone());
+                self.shared_transport_snapshot.update_transport(
+                    graph_sample_rate,
+                    TransportClock {
+                        state: transport_update.state,
+                        anchor_engine_samples: transport_update.anchor_engine_samples,
+                        anchor_transport_samples: transport_update.anchor_transport_samples,
+                    },
+                );
             }
         }
         for (_key, graph) in &mut self.graphs_per_node {
@@ -3482,7 +3583,15 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.play()?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
-                ggc.send_transport_update(transport_update);
+                ggc.send_transport_update(transport_update.clone());
+                self.shared_transport_snapshot.update_transport(
+                    transport_update.clock_sample_rate as u64,
+                    TransportClock {
+                        state: transport_update.state,
+                        anchor_engine_samples: transport_update.anchor_engine_samples,
+                        anchor_transport_samples: transport_update.anchor_transport_samples,
+                    },
+                );
             }
             Ok(())
         } else {
@@ -3495,7 +3604,15 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.pause()?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
-                ggc.send_transport_update(transport_update);
+                ggc.send_transport_update(transport_update.clone());
+                self.shared_transport_snapshot.update_transport(
+                    transport_update.clock_sample_rate as u64,
+                    TransportClock {
+                        state: transport_update.state,
+                        anchor_engine_samples: transport_update.anchor_engine_samples,
+                        anchor_transport_samples: transport_update.anchor_transport_samples,
+                    },
+                );
             }
             Ok(())
         } else {
@@ -3508,7 +3625,15 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.seek_seconds(position)?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
-                ggc.send_transport_update(transport_update);
+                ggc.send_transport_update(transport_update.clone());
+                self.shared_transport_snapshot.update_transport(
+                    transport_update.clock_sample_rate as u64,
+                    TransportClock {
+                        state: transport_update.state,
+                        anchor_engine_samples: transport_update.anchor_engine_samples,
+                        anchor_transport_samples: transport_update.anchor_transport_samples,
+                    },
+                );
             }
             Ok(())
         } else {
@@ -3521,7 +3646,15 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.seek_beats(position)?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
-                ggc.send_transport_update(transport_update);
+                ggc.send_transport_update(transport_update.clone());
+                self.shared_transport_snapshot.update_transport(
+                    transport_update.clock_sample_rate as u64,
+                    TransportClock {
+                        state: transport_update.state,
+                        anchor_engine_samples: transport_update.anchor_engine_samples,
+                        anchor_transport_samples: transport_update.anchor_transport_samples,
+                    },
+                );
             }
             Ok(())
         } else {
@@ -3884,7 +4017,6 @@ impl Graph {
             timestamp: Arc::new(AtomicU64::new(0)),
             observability: observability.clone(),
         };
-
         let graph_gen = graph_gen::make_graph_gen(graph_gen::GraphGenBuildArgs {
             sample_rate: self.sample_rate,
             parent_sample_rate: parent_graph_sample_rate,

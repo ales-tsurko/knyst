@@ -29,7 +29,7 @@ use crate::{
     graph::{
         connection::{ConnectionBundle, ConnectionError, InputBundle},
         Connection, FreeError, GenOrGraph, GenOrGraphEnum, Graph, GraphId, GraphSettings, NodeId,
-        ParameterChange, SimultaneousChanges,
+        ParameterChange, SharedTransportSnapshotState, SimultaneousChanges,
     },
     handles::{GraphHandle, Handle},
     inputs,
@@ -254,6 +254,8 @@ pub trait KnystCommands {
     fn request_transport_snapshot(
         &mut self,
     ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>>;
+    /// Return the current transport snapshot without a controller roundtrip.
+    fn current_transport_snapshot(&self) -> Option<TransportSnapshot>;
     /// Request current runtime observability metrics.
     fn request_observability_snapshot(
         &mut self,
@@ -323,6 +325,7 @@ pub struct MultiThreadedKnystCommands {
     /// The vec holding changes to be later scheduled as a bundle
     changes_bundle: Vec<NodeChanges>,
     changes_bundle_time: Time,
+    transport_snapshot_state: Arc<SharedTransportSnapshotState>,
 }
 
 impl MultiThreadedKnystCommands {
@@ -775,6 +778,10 @@ impl KnystCommands for MultiThreadedKnystCommands {
             self.report_error(error);
         }
         receiver
+    }
+
+    fn current_transport_snapshot(&self) -> Option<TransportSnapshot> {
+        self.transport_snapshot_state.snapshot()
     }
 
     fn request_observability_snapshot(
@@ -1274,6 +1281,7 @@ impl Controller {
             bundle_changes: false,
             changes_bundle: vec![],
             changes_bundle_time: Time::Immediately,
+            transport_snapshot_state: self.top_level_graph.shared_transport_snapshot(),
         }
     }
 
@@ -1281,6 +1289,7 @@ impl Controller {
     pub fn start_on_new_thread(self) -> MultiThreadedKnystCommands {
         let top_level_graph_id = self.top_level_graph.id();
         let top_level_graph_settings = self.top_level_graph.graph_settings();
+        let transport_snapshot_state = self.top_level_graph.shared_transport_snapshot();
         let controller_block_size = top_level_graph_settings.block_size as u32;
         let controller_sample_rate = top_level_graph_settings.sample_rate.round() as u32;
         let mut controller = self;
@@ -1305,6 +1314,7 @@ impl Controller {
             bundle_changes: false,
             changes_bundle: vec![],
             changes_bundle_time: Time::Immediately,
+            transport_snapshot_state,
         }
     }
 }
@@ -1329,7 +1339,7 @@ mod tests {
     use super::{schedule_bundle, Command, Controller, ControllerError};
     use crate as knyst;
     use crate::{
-        graph::{Graph, GraphSettings, NodeId},
+        graph::{Graph, GraphSettings, NodeId, TransportState},
         knyst_commands,
         offline::KnystOffline,
         prelude::*,
@@ -1563,6 +1573,54 @@ mod tests {
             .recv()
             .expect("transport snapshot response should be sent");
         assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn current_transport_snapshot_returns_none_without_running_scheduler() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let controller = new_test_controller(errors);
+        let commands = controller.get_knyst_commands();
+
+        assert!(commands.current_transport_snapshot().is_none());
+    }
+
+    #[test]
+    fn current_transport_snapshot_tracks_play_pause_and_seek() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 2);
+        let mut commands = offline.context().commands();
+
+        let initial = commands
+            .current_transport_snapshot()
+            .expect("offline scheduler should expose an initial transport snapshot");
+        assert_eq!(initial.state, TransportState::Playing);
+        assert_eq!(initial.samples, 0);
+        assert_eq!(initial.seconds, Seconds::ZERO);
+
+        commands.transport_pause();
+        offline.process_block();
+        let paused = commands
+            .current_transport_snapshot()
+            .expect("paused transport snapshot should be available");
+        assert_eq!(paused.state, TransportState::Paused);
+        assert_eq!(paused.samples, 0);
+
+        let target = Seconds::from_seconds_f64(0.5);
+        commands.transport_seek_to_seconds(target);
+        offline.process_block();
+        let sought = commands
+            .current_transport_snapshot()
+            .expect("sought transport snapshot should be available");
+        assert_eq!(sought.state, TransportState::Paused);
+        assert_eq!(sought.seconds, target);
+        assert_eq!(sought.samples, target.to_samples(48_000));
+
+        commands.transport_play();
+        offline.process_block();
+        let resumed = commands
+            .current_transport_snapshot()
+            .expect("resumed transport snapshot should be available");
+        assert_eq!(resumed.state, TransportState::Playing);
+        assert!(resumed.samples >= sought.samples);
     }
 
     #[test]
