@@ -47,6 +47,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 enum Command {
     Push {
         gen_or_graph: GenOrGraphEnum,
+        inputs: InputBundle,
         node_address: NodeId,
         graph_id: GraphId,
         start_time: Time,
@@ -84,12 +85,14 @@ impl std::fmt::Debug for Command {
         match self {
             Self::Push {
                 gen_or_graph,
+                inputs: _,
                 node_address,
                 graph_id,
                 start_time,
             } => f
                 .debug_struct("Push")
                 .field("gen_or_graph", gen_or_graph)
+                .field("has_inputs", &true)
                 .field("node_address", node_address)
                 .field("graph_id", graph_id)
                 .field("start_time", start_time)
@@ -377,30 +380,35 @@ impl KnystCommands for MultiThreadedKnystCommands {
     }
     /// Push a Gen or Graph to the default Graph.
     fn push(&mut self, gen_or_graph: impl GenOrGraph, inputs: impl Into<InputBundle>) -> NodeId {
-        let node_id = {
-            let local_node_id = LOCAL_GRAPH.with_borrow_mut(|g| {
-                if let Some(g) = g.last_mut() {
-                    let mut node_id = NodeId::new(g.id());
-                    g.push_with_existing_address_at_time(
-                        gen_or_graph,
-                        &mut node_id,
-                        self.changes_bundle_time,
-                    );
-                    Ok(node_id)
-                } else {
-                    Err(gen_or_graph)
-                }
-            });
-            match local_node_id {
-                Ok(node_id) => node_id,
-                Err(gen_or_graph) => self
-                    .push_to_graph_without_inputs(gen_or_graph, self.selected_graph_remote_graph),
-            }
-        };
-        // Connect any inputs
         let inputs: InputBundle = inputs.into();
-        self.connect_bundle(inputs.to(node_id));
-        node_id
+        let local_graph_id = LOCAL_GRAPH.with_borrow(|g| g.last().map(|g| g.id()));
+        if let Some(local_graph_id) = local_graph_id {
+            let node_id = LOCAL_GRAPH.with_borrow_mut(|g| {
+                let g = g.last_mut().expect("local graph should still exist");
+                let mut node_id = NodeId::new(local_graph_id);
+                g.push_with_existing_address_at_time(
+                    gen_or_graph,
+                    &mut node_id,
+                    self.changes_bundle_time,
+                );
+                node_id
+            });
+            self.connect_bundle(inputs.to(node_id));
+            node_id
+        } else {
+            let new_node_address = NodeId::new(self.selected_graph_remote_graph);
+            let command = Command::Push {
+                gen_or_graph: gen_or_graph.into_gen_or_graph_enum(),
+                inputs,
+                node_address: new_node_address,
+                graph_id: self.selected_graph_remote_graph,
+                start_time: self.changes_bundle_time,
+            };
+            if let Err(error) = self.send_command(command) {
+                self.report_error(error);
+            }
+            new_node_address
+        }
     }
     /// Push a Gen or Graph to the Graph with the specified id without specifying inputs.
     fn push_to_graph_without_inputs(
@@ -433,6 +441,7 @@ impl KnystCommands for MultiThreadedKnystCommands {
                 let new_node_address = NodeId::new(graph_id);
                 let command = Command::Push {
                     gen_or_graph,
+                    inputs: inputs![],
                     node_address: new_node_address,
                     graph_id,
                     start_time: self.changes_bundle_time,
@@ -451,10 +460,37 @@ impl KnystCommands for MultiThreadedKnystCommands {
         graph_id: GraphId,
         inputs: impl Into<InputBundle>,
     ) -> NodeId {
-        let new_node_address = self.push_to_graph_without_inputs(gen_or_graph, graph_id);
         let inputs: InputBundle = inputs.into();
-        self.connect_bundle(inputs.to(new_node_address));
-        new_node_address
+        let local_graph_matches =
+            LOCAL_GRAPH.with_borrow(|g| g.last().is_some_and(|g| g.id() == graph_id));
+        if local_graph_matches {
+            let gen_or_graph = gen_or_graph.into_gen_or_graph_enum();
+            let node_id = LOCAL_GRAPH.with_borrow_mut(|g| {
+                let g = g.last_mut().expect("local graph should still exist");
+                let mut node_id = NodeId::new(graph_id);
+                if let Err(e) =
+                    g.push_with_existing_address_to_graph(gen_or_graph, &mut node_id, g.id())
+                {
+                    self.report_error(e);
+                }
+                node_id
+            });
+            self.connect_bundle(inputs.to(node_id));
+            node_id
+        } else {
+            let new_node_address = NodeId::new(graph_id);
+            let command = Command::Push {
+                gen_or_graph: gen_or_graph.into_gen_or_graph_enum(),
+                inputs,
+                node_address: new_node_address,
+                graph_id,
+                start_time: self.changes_bundle_time,
+            };
+            if let Err(error) = self.send_command(command) {
+                self.report_error(error);
+            }
+            new_node_address
+        }
     }
     /// Create a new connections
     fn connect(&mut self, connection: Connection) {
@@ -1041,6 +1077,7 @@ impl Controller {
         let result: Result<(), crate::KnystError> = match command {
             Command::Push {
                 gen_or_graph,
+                inputs,
                 mut node_address,
                 graph_id,
                 start_time,
@@ -1056,7 +1093,9 @@ impl Controller {
                 {
                     Err(From::from(e))
                 } else {
-                    Ok(())
+                    self.top_level_graph
+                        .apply_inputs_to_new_node(node_address, inputs)
+                        .map_err(From::from)
                 }
             }
             Command::Connect(connection) => {
@@ -1482,6 +1521,42 @@ mod tests {
             }
             GenState::Continue
         }
+    }
+
+    struct ConstantSignalGen;
+    #[impl_gen]
+    impl ConstantSignalGen {
+        fn new() -> Self {
+            Self
+        }
+        #[process]
+        fn process(&mut self, out: &mut [Sample]) -> GenState {
+            for sample in out.iter_mut() {
+                *sample = 0.25;
+            }
+            GenState::Continue
+        }
+    }
+
+    struct GainGen;
+    #[impl_gen]
+    impl GainGen {
+        fn new() -> Self {
+            Self
+        }
+        #[process]
+        fn process(&mut self, input: &[Sample], gain: &[Sample], out: &mut [Sample]) -> GenState {
+            for ((input, gain), out) in input.iter().zip(gain.iter()).zip(out.iter_mut()) {
+                *out = *input * *gain;
+            }
+            GenState::Continue
+        }
+    }
+
+    fn output_has_signal(offline: &KnystOffline, channel: usize) -> bool {
+        offline
+            .output_channel(channel)
+            .is_some_and(|output| output.iter().any(|sample| sample.abs() > 1.0e-4))
     }
 
     #[test]
@@ -1955,5 +2030,65 @@ mod tests {
         }));
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn preexisting_gain_node_goes_silent_after_nonzero_seek() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 1);
+        offline.context().with_activation(|| {
+            let source = knyst_commands().push(ConstantSignalGen::new(), inputs![]);
+            let gain = knyst_commands().push(GainGen::new(), inputs!((1 : 1.0)));
+            knyst_commands().connect(source.to(gain));
+            knyst_commands().connect(Connection::graph_output(gain));
+        });
+
+        knyst_commands().transport_pause();
+        knyst_commands().transport_seek_to_beats(Beats::from_beats(1));
+        for _ in 0..8 {
+            offline.process_block();
+        }
+        knyst_commands().transport_play();
+        for _ in 0..16 {
+            offline.process_block();
+        }
+
+        assert!(
+            output_has_signal(&offline, 0),
+            "preexisting gain node went silent after non-zero transport seek"
+        );
+    }
+
+    #[test]
+    fn settled_preexisting_gain_node_survives_nonzero_seek() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 1);
+        offline.context().with_activation(|| {
+            let source = knyst_commands().push(ConstantSignalGen::new(), inputs![]);
+            let gain = knyst_commands().push(GainGen::new(), inputs!((1 : 1.0)));
+            knyst_commands().connect(source.to(gain));
+            knyst_commands().connect(Connection::graph_output(gain));
+        });
+
+        for _ in 0..16 {
+            offline.process_block();
+        }
+        assert!(
+            output_has_signal(&offline, 0),
+            "preexisting gain node should be audible before seek"
+        );
+
+        knyst_commands().transport_pause();
+        knyst_commands().transport_seek_to_beats(Beats::from_beats(1));
+        for _ in 0..8 {
+            offline.process_block();
+        }
+        knyst_commands().transport_play();
+        for _ in 0..16 {
+            offline.process_block();
+        }
+
+        assert!(
+            output_has_signal(&offline, 0),
+            "settled preexisting gain node went silent after non-zero transport seek"
+        );
     }
 }

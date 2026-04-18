@@ -40,7 +40,7 @@ mod node;
 pub mod run_graph;
 pub use crate::node_buffer::NodeBufferRef;
 pub use connection::Connection;
-use connection::ConnectionError;
+use connection::{ConnectionError, InputBundle};
 use node::Node;
 pub use run_graph::{RunGraph, RunGraphSettings};
 
@@ -3021,6 +3021,55 @@ impl Graph {
                 Err(e) => {
                     return Err(e);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply initial inputs to a freshly pushed node on a running graph.
+    ///
+    /// Constant inputs are written directly into the new node so they become part of the next
+    /// committed graph state instead of arriving later through the immediate scheduler path.
+    /// Non-constant inputs still use regular graph connections.
+    pub(crate) fn apply_inputs_to_new_node(
+        &mut self,
+        node_id: NodeId,
+        inputs: InputBundle,
+    ) -> Result<(), ConnectionError> {
+        let bundle = inputs.to(node_id);
+        for connection in bundle.as_connections() {
+            match connection {
+                Connection::Constant {
+                    value,
+                    sink: Some(sink),
+                    to_index,
+                    to_label,
+                } if sink == node_id => {
+                    let Some((sink_key, _)) = self.node_ids.iter().find(|(_key, &id)| id == sink)
+                    else {
+                        return Err(ConnectionError::NodeNotFound(Connection::Constant {
+                            value,
+                            sink: Some(sink),
+                            to_index,
+                            to_label,
+                        }));
+                    };
+
+                    let input = if let Some(index) = to_index {
+                        index
+                    } else if let Some(label) = to_label {
+                        if let Some(index) = self.input_index_from_label(sink_key, label) {
+                            index
+                        } else {
+                            return Err(ConnectionError::InvalidInputLabel(label));
+                        }
+                    } else {
+                        0
+                    };
+
+                    self.get_nodes_mut()[sink_key].set_constant(value, input);
+                }
+                other => self.connect(other)?,
             }
         }
         Ok(())
