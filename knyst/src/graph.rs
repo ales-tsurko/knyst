@@ -2249,6 +2249,7 @@ impl Graph {
                 musical_time_map.clone(),
             );
             if let Some(transport_update) = ggc.scheduler.transport_update() {
+                let transport_update = ggc.next_transport_update(transport_update.clone());
                 ggc.send_transport_update(transport_update.clone());
                 self.shared_transport_snapshot.update_transport(
                     graph_sample_rate,
@@ -3583,6 +3584,7 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.play()?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
+                let transport_update = ggc.next_transport_update(transport_update.clone());
                 ggc.send_transport_update(transport_update.clone());
                 self.shared_transport_snapshot.update_transport(
                     transport_update.clock_sample_rate as u64,
@@ -3604,6 +3606,7 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.pause()?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
+                let transport_update = ggc.next_transport_update(transport_update.clone());
                 ggc.send_transport_update(transport_update.clone());
                 self.shared_transport_snapshot.update_transport(
                     transport_update.clock_sample_rate as u64,
@@ -3625,6 +3628,7 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.seek_seconds(position)?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
+                let transport_update = ggc.next_transport_update(transport_update.clone());
                 ggc.send_transport_update(transport_update.clone());
                 self.shared_transport_snapshot.update_transport(
                     transport_update.clock_sample_rate as u64,
@@ -3646,6 +3650,7 @@ impl Graph {
         if let Some(ggc) = &mut self.graph_gen_communicator {
             ggc.scheduler.seek_beats(position)?;
             if let Some(transport_update) = ggc.scheduler.transport_update() {
+                let transport_update = ggc.next_transport_update(transport_update.clone());
                 ggc.send_transport_update(transport_update.clone());
                 self.shared_transport_snapshot.update_transport(
                     transport_update.clock_sample_rate as u64,
@@ -3997,6 +4002,7 @@ impl Graph {
         let (scheduled_change_producer, rb_consumer) = RingBuffer::new(scheduler_buffer_size);
         let (clock_update_producer, clock_update_consumer) = RingBuffer::new(10);
         let (transport_update_producer, transport_update_consumer) = RingBuffer::new(10);
+        let settled_transport_generation = Arc::new(AtomicU64::new(0));
         let schedule_generation = match &scheduler {
             Scheduler::Stopped {
                 schedule_generation,
@@ -4012,6 +4018,7 @@ impl Graph {
             schedule_generation.clone(),
             clock_update_consumer,
             transport_update_consumer,
+            settled_transport_generation.clone(),
             scheduler_buffer_size,
         );
         let observability = Arc::new(ObservabilityState::new());
@@ -4022,6 +4029,8 @@ impl Graph {
             scheduled_change_producer,
             clock_update_producer,
             transport_update_producer,
+            settled_transport_generation,
+            next_transport_generation: 0,
             task_data_to_be_dropped_consumer,
             new_task_data_producer,
             next_change_flag: task_data.applied.clone(),
@@ -4123,6 +4132,20 @@ impl Graph {
             .as_ref()
             .map(|ggc| ggc.next_change_flag.clone())
             .unwrap_or_else(|| Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Returns the audio-thread-applied transport generation together with the
+    /// current controller-side target generation.
+    pub fn transport_settled_state(&self) -> (Arc<AtomicU64>, u64) {
+        self.graph_gen_communicator
+            .as_ref()
+            .map(|ggc| {
+                (
+                    ggc.settled_transport_generation.clone(),
+                    ggc.next_transport_generation,
+                )
+            })
+            .unwrap_or_else(|| (Arc::new(AtomicU64::new(0)), 0))
     }
 
     /// Check if there are any old nodes or other resources that have been
@@ -4588,6 +4611,7 @@ impl Scheduler {
                 musical_time_map,
                 ..
             } => Some(TransportUpdate {
+                generation: 0,
                 state: transport.state,
                 anchor_engine_samples: transport.anchor_engine_samples,
                 anchor_transport_samples: transport.anchor_transport_samples,
@@ -4729,6 +4753,7 @@ struct ClockUpdate {
 
 #[derive(Clone)]
 struct TransportUpdate {
+    generation: u64,
     state: TransportState,
     anchor_engine_samples: u64,
     anchor_transport_samples: u64,
@@ -4743,6 +4768,7 @@ struct ScheduleReceiver {
     seen_generation: u64,
     clock_update_consumer: rtrb::Consumer<ClockUpdate>,
     transport_update_consumer: rtrb::Consumer<TransportUpdate>,
+    settled_transport_generation: Arc<AtomicU64>,
 }
 impl ScheduleReceiver {
     fn new(
@@ -4750,6 +4776,7 @@ impl ScheduleReceiver {
         schedule_generation: Arc<AtomicU64>,
         clock_update_consumer: rtrb::Consumer<ClockUpdate>,
         transport_update_consumer: rtrb::Consumer<TransportUpdate>,
+        settled_transport_generation: Arc<AtomicU64>,
         capacity: usize,
     ) -> Self {
         Self {
@@ -4759,6 +4786,7 @@ impl ScheduleReceiver {
             schedule_generation,
             clock_update_consumer,
             transport_update_consumer,
+            settled_transport_generation,
         }
     }
     fn clock_update(&mut self, sample_rate: Sample) -> Option<u64> {
@@ -4798,6 +4826,8 @@ impl ScheduleReceiver {
                 },
                 transport.musical_time_map,
             ));
+            self.settled_transport_generation
+                .store(transport.generation, Ordering::SeqCst);
         }
         new_transport
     }
@@ -4861,6 +4891,8 @@ struct GraphGenCommunicator {
     clock_update_producer: rtrb::Producer<ClockUpdate>,
     /// For sending transport updates to the audio thread.
     transport_update_producer: rtrb::Producer<TransportUpdate>,
+    settled_transport_generation: Arc<AtomicU64>,
+    next_transport_generation: u64,
     /// The ring buffer for sending scheduled changes to the audio thread
     scheduled_change_producer: rtrb::Producer<ScheduledChange>,
     timestamp: Arc<AtomicU64>,
@@ -4903,6 +4935,14 @@ impl GraphGenCommunicator {
         self.transport_update_producer
             .push(transport_update)
             .unwrap();
+    }
+
+    fn next_transport_update(&mut self, transport_update: TransportUpdate) -> TransportUpdate {
+        self.next_transport_generation = self.next_transport_generation.wrapping_add(1);
+        TransportUpdate {
+            generation: self.next_transport_generation,
+            ..transport_update
+        }
     }
 
     /// Sends the updated tasks to the GraphGen. NB: Always check if any

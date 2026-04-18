@@ -170,6 +170,10 @@ impl KnystCommands for SharedKnystCommands {
         self.lock().request_graph_settled()
     }
 
+    fn request_transport_settled(&mut self) -> std::sync::mpsc::Receiver<()> {
+        self.lock().request_transport_settled()
+    }
+
     fn transport_play(&mut self) {
         self.lock().transport_play();
     }

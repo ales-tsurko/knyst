@@ -10,7 +10,10 @@
 use crate::resources::Resources;
 use std::{
     cell::RefCell,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -66,6 +69,7 @@ enum Command {
     ScheduleBeatCallback(BeatCallback, StartBeat),
     RequestInspection(std::sync::mpsc::SyncSender<GraphInspection>),
     RequestGraphSettled(std::sync::mpsc::SyncSender<()>),
+    RequestTransportSettled(std::sync::mpsc::SyncSender<()>),
     RequestTransportSnapshot(std::sync::mpsc::SyncSender<Option<TransportSnapshot>>),
     RequestObservabilitySnapshot(std::sync::mpsc::SyncSender<Option<ObservabilitySnapshot>>),
     TransportPlay,
@@ -113,6 +117,10 @@ impl std::fmt::Debug for Command {
             Self::RequestGraphSettled(arg0) => {
                 f.debug_tuple("RequestGraphSettled").field(arg0).finish()
             }
+            Self::RequestTransportSettled(arg0) => f
+                .debug_tuple("RequestTransportSettled")
+                .field(arg0)
+                .finish(),
             Self::RequestTransportSnapshot(arg0) => f
                 .debug_tuple("RequestTransportSnapshot")
                 .field(arg0)
@@ -155,6 +163,9 @@ pub enum ControllerError {
     /// Sending a transport snapshot response failed because the receiver dropped.
     #[error("Failed to send transport snapshot response because the receiver was dropped.")]
     TransportSnapshotResponseChannelClosed,
+    /// Sending a transport-settled response failed because the receiver dropped.
+    #[error("Failed to send transport-settled response because the receiver was dropped.")]
+    TransportSettledResponseChannelClosed,
     /// Sending an observability snapshot response failed because the receiver dropped.
     #[error("Failed to send observability snapshot response because the receiver was dropped.")]
     ObservabilitySnapshotResponseChannelClosed,
@@ -252,6 +263,9 @@ pub trait KnystCommands {
     /// Request a notification when graph topology/task updates submitted before this
     /// call have been applied on the audio thread.
     fn request_graph_settled(&mut self) -> std::sync::mpsc::Receiver<()>;
+    /// Request a notification when transport updates submitted before this call
+    /// have been applied on the audio thread.
+    fn request_transport_settled(&mut self) -> std::sync::mpsc::Receiver<()>;
     /// Start transport playback.
     fn transport_play(&mut self);
     /// Pause transport playback.
@@ -764,6 +778,14 @@ impl KnystCommands for MultiThreadedKnystCommands {
         receiver
     }
 
+    fn request_transport_settled(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        if let Err(error) = self.send_command(Command::RequestTransportSettled(sender)) {
+            self.report_error(error);
+        }
+        receiver
+    }
+
     fn transport_play(&mut self) {
         if let Err(error) = self.send_command(Command::TransportPlay) {
             self.report_error(error);
@@ -986,6 +1008,7 @@ pub struct Controller {
     // pushed.
     command_queue: Vec<(Instant, Command)>,
     graph_settled_waiters: Vec<(Arc<AtomicBool>, std::sync::mpsc::SyncSender<()>)>,
+    transport_settled_waiters: Vec<(Arc<AtomicU64>, u64, std::sync::mpsc::SyncSender<()>)>,
     error_handler: Box<dyn FnMut(KnystError) + Send>,
     beat_callbacks: Vec<BeatCallback>,
 }
@@ -1006,6 +1029,7 @@ impl Controller {
             command_sender: sender,
             command_queue: vec![],
             graph_settled_waiters: vec![],
+            transport_settled_waiters: vec![],
             error_handler: Box::new(error_handler),
             resources_receiver,
             resources_sender,
@@ -1174,6 +1198,18 @@ impl Controller {
                     Ok(())
                 }
             }
+            Command::RequestTransportSettled(sender) => {
+                let (settled, target_generation) = self.top_level_graph.transport_settled_state();
+                if settled.load(std::sync::atomic::Ordering::SeqCst) >= target_generation {
+                    sender
+                        .send(())
+                        .map_err(|_| ControllerError::TransportSettledResponseChannelClosed.into())
+                } else {
+                    self.transport_settled_waiters
+                        .push((settled, target_generation, sender));
+                    Ok(())
+                }
+            }
             Command::RequestTransportSnapshot(sender) => sender
                 .send(self.top_level_graph.transport_snapshot())
                 .map_err(|_| ControllerError::TransportSnapshotResponseChannelClosed.into()),
@@ -1237,6 +1273,23 @@ impl Controller {
                 if sender.send(()).is_err() {
                     (*self.error_handler)(
                         ControllerError::GraphSettledResponseChannelClosed.into(),
+                    );
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.transport_settled_waiters.len() {
+            if self.transport_settled_waiters[i]
+                .0
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= self.transport_settled_waiters[i].1
+            {
+                let (_, _, sender) = self.transport_settled_waiters.remove(i);
+                if sender.send(()).is_err() {
+                    (*self.error_handler)(
+                        ControllerError::TransportSettledResponseChannelClosed.into(),
                     );
                 }
             } else {
@@ -1658,6 +1711,56 @@ mod tests {
         receiver
             .recv_timeout(Duration::from_millis(50))
             .expect("graph should settle after controller and audio each advance once");
+    }
+
+    #[test]
+    fn request_transport_settled_reports_dropped_receiver() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+
+        controller.apply_command(Command::RequestTransportSettled(sender));
+
+        let errors = errors
+            .lock()
+            .expect("test error sink lock should not be poisoned");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            KnystError::ControllerError(ControllerError::TransportSettledResponseChannelClosed)
+        ));
+    }
+
+    #[test]
+    fn request_transport_settled_returns_immediately_without_pending_audio_changes() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 2);
+        let mut commands = offline.context().commands();
+        offline.process_block();
+
+        let receiver = commands.request_transport_settled();
+        offline.process_block();
+        receiver
+            .recv_timeout(Duration::from_millis(50))
+            .expect("settled transport should respond immediately");
+    }
+
+    #[test]
+    fn request_transport_settled_waits_for_audio_thread_transport_application() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 2);
+        let mut commands = offline.context().commands();
+
+        commands.transport_seek_to_beats(Beats::from_beats(4));
+        let receiver = commands.request_transport_settled();
+        offline.process_block();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(10)).is_err(),
+            "transport should not be settled until the audio thread consumes the update"
+        );
+        offline.process_block();
+        receiver
+            .recv_timeout(Duration::from_millis(50))
+            .expect("transport should settle after controller and audio each advance once");
     }
 
     #[test]
