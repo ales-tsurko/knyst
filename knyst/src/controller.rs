@@ -43,6 +43,9 @@ use crate::{
 use audio_thread_priority::promote_current_thread_to_real_time;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
+const CONTROLLER_ACTIVE_SLEEP: Duration = Duration::from_micros(100);
+const CONTROLLER_IDLE_SLEEP: Duration = Duration::from_millis(1);
+
 /// Encodes commands sent from a [`KnystCommands`]
 enum Command {
     Push {
@@ -1374,6 +1377,9 @@ impl Controller {
     }
 
     fn run_callbacks(&mut self) {
+        if self.beat_callbacks.is_empty() {
+            return;
+        }
         // Get current time in MusicalTime
         let current_time_beats = self.top_level_graph.get_current_time_musical();
         let mut k = self.get_knyst_commands();
@@ -1412,6 +1418,18 @@ impl Controller {
         all_commands_received
     }
 
+    fn loop_sleep_duration(&self, all_commands_received: bool) -> Duration {
+        if !all_commands_received
+            || !self.beat_callbacks.is_empty()
+            || !self.graph_settled_waiters.is_empty()
+            || !self.transport_settled_waiters.is_empty()
+        {
+            CONTROLLER_ACTIVE_SLEEP
+        } else {
+            CONTROLLER_IDLE_SLEEP
+        }
+    }
+
     /// Create a [`KnystCommands`] that can communicate with [`Self`]
     pub fn get_knyst_commands(&self) -> MultiThreadedKnystCommands {
         MultiThreadedKnystCommands {
@@ -1441,8 +1459,12 @@ impl Controller {
             .spawn(move || {
                 elevate_controller_thread_priority(controller_block_size, controller_sample_rate);
                 loop {
-                    while !controller.run(300) {}
-                    std::thread::sleep(Duration::from_micros(1));
+                    let all_commands_received = controller.run(300);
+                    if all_commands_received {
+                        std::thread::sleep(controller.loop_sleep_duration(all_commands_received));
+                    } else {
+                        std::thread::yield_now();
+                    }
                 }
             })
             .expect("failed to spawn knyst controller thread");
@@ -1477,7 +1499,10 @@ pub fn print_error_handler(e: KnystError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{schedule_bundle, Command, Controller, ControllerError};
+    use super::{
+        schedule_bundle, BeatCallback, Command, Controller, ControllerError,
+        CONTROLLER_ACTIVE_SLEEP, CONTROLLER_IDLE_SLEEP,
+    };
     use crate as knyst;
     use crate::{
         graph::{Graph, GraphSettings, NodeId, TransportState},
@@ -1488,7 +1513,7 @@ mod tests {
         KnystError,
     };
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     };
     use std::time::Duration;
@@ -2074,6 +2099,42 @@ mod tests {
             .expect("resumed transport snapshot should be available");
         assert_eq!(resumed.state, TransportState::Playing);
         assert!(resumed.samples >= sought.samples);
+    }
+
+    #[test]
+    fn controller_loop_uses_idle_sleep_without_callbacks_or_waiters() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let controller = new_test_controller(errors);
+
+        assert_eq!(controller.loop_sleep_duration(true), CONTROLLER_IDLE_SLEEP);
+    }
+
+    #[test]
+    fn controller_loop_uses_active_sleep_with_callbacks() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors);
+        controller
+            .beat_callbacks
+            .push(BeatCallback::new(|_, _| None, Beats::ZERO));
+
+        assert_eq!(
+            controller.loop_sleep_duration(true),
+            CONTROLLER_ACTIVE_SLEEP
+        );
+    }
+
+    #[test]
+    fn controller_loop_uses_active_sleep_with_pending_waiters() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = new_test_controller(errors);
+        let settled = Arc::new(AtomicU64::new(0));
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        controller.graph_settled_waiters.push((settled, 1, sender));
+
+        assert_eq!(
+            controller.loop_sleep_duration(true),
+            CONTROLLER_ACTIVE_SLEEP
+        );
     }
 
     #[test]
