@@ -724,8 +724,7 @@ impl Gen for GraphGen {
                     if change.timestamp < self.sample_counter {
                         change.removal_countdown += 1;
                         if change.removal_countdown >= 10 {
-                            let change = changes.remove(i);
-                            eprintln!("Removed scheduled change: {change:?}");
+                            changes.remove(i);
                             continue;
                         }
                     }

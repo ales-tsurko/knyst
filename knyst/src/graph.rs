@@ -4113,6 +4113,18 @@ impl Graph {
         }
     }
 
+    /// Returns a flag that becomes true once the latest committed task-data changes
+    /// have been applied on the audio thread.
+    pub fn graph_settled_flag(&self) -> Arc<AtomicBool> {
+        if !self.recalculation_required {
+            return Arc::new(AtomicBool::new(true));
+        }
+        self.graph_gen_communicator
+            .as_ref()
+            .map(|ggc| ggc.next_change_flag.clone())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(true)))
+    }
+
     /// Check if there are any old nodes or other resources that have been
     /// removed from the graph and can now be freed since they are no longer
     /// used on the audio thread.
