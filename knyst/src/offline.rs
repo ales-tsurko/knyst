@@ -62,6 +62,17 @@ impl KnystOffline {
             run_graph.process_block();
         }
     }
+    /// Run only the controller side without processing audio.
+    pub fn run_controller_only(&mut self) {
+        self.controller.run(10000);
+    }
+    /// Run only the audio side without advancing the controller.
+    pub fn run_audio_only(&mut self) {
+        if let Some(run_graph) = &mut self.test_backend.run_graph {
+            run_graph.run_resources_communication(10000);
+            run_graph.process_block();
+        }
+    }
     /// Fill one graph input channel for this block
     pub fn set_input(&mut self, index: usize, input: &[Sample]) {
         if let Some(run_graph) = &mut self.test_backend.run_graph {

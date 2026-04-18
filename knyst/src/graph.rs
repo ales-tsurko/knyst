@@ -3979,6 +3979,7 @@ impl Graph {
         let tasks = self.generate_tasks().into_boxed_slice();
         let output_tasks = self.generate_output_tasks().into_boxed_slice();
         let task_data = TaskData {
+            generation: 0,
             applied: Arc::new(AtomicBool::new(false)),
             tasks,
             output_tasks,
@@ -4002,6 +4003,7 @@ impl Graph {
         let (scheduled_change_producer, rb_consumer) = RingBuffer::new(scheduler_buffer_size);
         let (clock_update_producer, clock_update_consumer) = RingBuffer::new(10);
         let (transport_update_producer, transport_update_consumer) = RingBuffer::new(10);
+        let settled_graph_generation = Arc::new(AtomicU64::new(0));
         let settled_transport_generation = Arc::new(AtomicU64::new(0));
         let schedule_generation = match &scheduler {
             Scheduler::Stopped {
@@ -4029,6 +4031,8 @@ impl Graph {
             scheduled_change_producer,
             clock_update_producer,
             transport_update_producer,
+            settled_graph_generation,
+            next_graph_generation: 0,
             settled_transport_generation,
             next_transport_generation: 0,
             task_data_to_be_dropped_consumer,
@@ -4055,6 +4059,7 @@ impl Graph {
             new_task_data_consumer,
             arc_inputs_buffers_ptr: self.inputs_buffers_ptr.clone(),
             observability,
+            settled_graph_generation: graph_gen_communicator.settled_graph_generation.clone(),
         });
         self.graph_gen_communicator = Some(graph_gen_communicator);
         Ok(graph_gen)
@@ -4122,16 +4127,18 @@ impl Graph {
         }
     }
 
-    /// Returns a flag that becomes true once the latest committed task-data changes
-    /// have been applied on the audio thread.
-    pub fn graph_settled_flag(&self) -> Arc<AtomicBool> {
-        if !self.recalculation_required {
-            return Arc::new(AtomicBool::new(true));
-        }
+    /// Returns the audio-thread-applied graph generation together with the
+    /// current controller-side target generation.
+    pub fn graph_settled_state(&self) -> (Arc<AtomicU64>, u64) {
         self.graph_gen_communicator
             .as_ref()
-            .map(|ggc| ggc.next_change_flag.clone())
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(true)))
+            .map(|ggc| {
+                (
+                    ggc.settled_graph_generation.clone(),
+                    ggc.next_graph_generation,
+                )
+            })
+            .unwrap_or_else(|| (Arc::new(AtomicU64::new(0)), 0))
     }
 
     /// Returns the audio-thread-applied transport generation together with the
@@ -4871,6 +4878,7 @@ impl ScheduleReceiver {
 /// pointer to the TaskData. If there is a problem, the Boxes in TaskData may
 /// need to be raw pointers.
 struct TaskData {
+    generation: u64,
     // `applied` must be set to true when the running GraphGen receives it. This
     // signals that the changes in this TaskData have been applied and certain
     // Nodes may be dropped.
@@ -4891,6 +4899,8 @@ struct GraphGenCommunicator {
     clock_update_producer: rtrb::Producer<ClockUpdate>,
     /// For sending transport updates to the audio thread.
     transport_update_producer: rtrb::Producer<TransportUpdate>,
+    settled_graph_generation: Arc<AtomicU64>,
+    next_graph_generation: u64,
     settled_transport_generation: Arc<AtomicU64>,
     next_transport_generation: u64,
     /// The ring buffer for sending scheduled changes to the audio thread
@@ -4959,8 +4969,10 @@ impl GraphGenCommunicator {
 
         let current_change_flag =
             mem::replace(&mut self.next_change_flag, Arc::new(AtomicBool::new(false)));
+        self.next_graph_generation = self.next_graph_generation.wrapping_add(1);
 
         let td = TaskData {
+            generation: self.next_graph_generation,
             applied: current_change_flag,
             tasks,
             output_tasks,

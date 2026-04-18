@@ -1007,7 +1007,7 @@ pub struct Controller {
     // NodeAddress couldn't be resolved because the node had not yet been
     // pushed.
     command_queue: Vec<(Instant, Command)>,
-    graph_settled_waiters: Vec<(Arc<AtomicBool>, std::sync::mpsc::SyncSender<()>)>,
+    graph_settled_waiters: Vec<(Arc<AtomicU64>, u64, std::sync::mpsc::SyncSender<()>)>,
     transport_settled_waiters: Vec<(Arc<AtomicU64>, u64, std::sync::mpsc::SyncSender<()>)>,
     error_handler: Box<dyn FnMut(KnystError) + Send>,
     beat_callbacks: Vec<BeatCallback>,
@@ -1188,13 +1188,14 @@ impl Controller {
                 .send(self.top_level_graph.generate_inspection())
                 .map_err(|_| ControllerError::InspectionResponseChannelClosed.into()),
             Command::RequestGraphSettled(sender) => {
-                let settled = self.top_level_graph.graph_settled_flag();
-                if settled.load(std::sync::atomic::Ordering::SeqCst) {
+                let (settled, target_generation) = self.top_level_graph.graph_settled_state();
+                if settled.load(std::sync::atomic::Ordering::SeqCst) >= target_generation {
                     sender
                         .send(())
                         .map_err(|_| ControllerError::GraphSettledResponseChannelClosed.into())
                 } else {
-                    self.graph_settled_waiters.push((settled, sender));
+                    self.graph_settled_waiters
+                        .push((settled, target_generation, sender));
                     Ok(())
                 }
             }
@@ -1268,8 +1269,9 @@ impl Controller {
             if self.graph_settled_waiters[i]
                 .0
                 .load(std::sync::atomic::Ordering::SeqCst)
+                >= self.graph_settled_waiters[i].1
             {
-                let (_, sender) = self.graph_settled_waiters.remove(i);
+                let (_, _, sender) = self.graph_settled_waiters.remove(i);
                 if sender.send(()).is_err() {
                     (*self.error_handler)(
                         ControllerError::GraphSettledResponseChannelClosed.into(),
@@ -1701,16 +1703,41 @@ mod tests {
         let mut commands = offline.context().commands();
 
         let _ = commands.push(OneGen::new(), crate::inputs![]);
+        offline.run_controller_only();
         let receiver = commands.request_graph_settled();
-        offline.process_block();
+        offline.run_controller_only();
         assert!(
             receiver.recv_timeout(Duration::from_millis(10)).is_err(),
-            "graph should not be settled until the controller observes audio-thread application"
+            "graph should not be settled before the audio thread swaps task data"
         );
-        offline.process_block();
+        offline.run_audio_only();
+        offline.run_controller_only();
         receiver
             .recv_timeout(Duration::from_millis(50))
-            .expect("graph should settle after controller and audio each advance once");
+            .expect("graph should settle after controller commit and audio-thread application");
+    }
+
+    #[test]
+    fn request_graph_settled_waits_after_controller_commit_but_before_audio_swap() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 2);
+        let mut commands = offline.context().commands();
+        offline.process_block();
+
+        let _ = commands.push(OneGen::new(), crate::inputs![]);
+        offline.run_controller_only();
+
+        let receiver = commands.request_graph_settled();
+        offline.run_controller_only();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(10)).is_err(),
+            "graph should not be reported settled after controller commit alone"
+        );
+
+        offline.run_audio_only();
+        offline.run_controller_only();
+        receiver
+            .recv_timeout(Duration::from_millis(50))
+            .expect("graph should settle once the audio thread swaps to the committed task data");
     }
 
     #[test]
@@ -1751,16 +1778,41 @@ mod tests {
         let mut commands = offline.context().commands();
 
         commands.transport_seek_to_beats(Beats::from_beats(4));
+        offline.run_controller_only();
         let receiver = commands.request_transport_settled();
-        offline.process_block();
+        offline.run_controller_only();
         assert!(
             receiver.recv_timeout(Duration::from_millis(10)).is_err(),
             "transport should not be settled until the audio thread consumes the update"
         );
-        offline.process_block();
+        offline.run_audio_only();
+        offline.run_controller_only();
         receiver
             .recv_timeout(Duration::from_millis(50))
-            .expect("transport should settle after controller and audio each advance once");
+            .expect("transport should settle after controller commit and audio-thread application");
+    }
+
+    #[test]
+    fn request_transport_settled_waits_after_controller_commit_but_before_audio_apply() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 2);
+        let mut commands = offline.context().commands();
+        offline.process_block();
+
+        commands.transport_seek_to_beats(Beats::from_beats(4));
+        offline.run_controller_only();
+
+        let receiver = commands.request_transport_settled();
+        offline.run_controller_only();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(10)).is_err(),
+            "transport should not be reported settled after controller commit alone"
+        );
+
+        offline.run_audio_only();
+        offline.run_controller_only();
+        receiver
+            .recv_timeout(Duration::from_millis(50))
+            .expect("transport should settle once the audio thread consumes the committed update");
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub(super) struct GraphGenBuildArgs {
     pub new_task_data_consumer: rtrb::Consumer<TaskData>,
     pub arc_inputs_buffers_ptr: Arc<OwnedRawBuffer>,
     pub observability: Arc<ObservabilityState>,
+    pub settled_graph_generation: Arc<AtomicU64>,
 }
 
 pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
@@ -52,6 +53,7 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         new_task_data_consumer,
         arc_inputs_buffers_ptr,
         observability,
+        settled_graph_generation,
     } = args;
 
     let graph_gen = Box::new(GraphGen {
@@ -70,6 +72,7 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         new_task_data_consumer,
         _arc_inputs_buffers_ptr: arc_inputs_buffers_ptr,
         observability,
+        settled_graph_generation,
         musical_time_map: None,
         transport_clock: None,
     });
@@ -570,6 +573,7 @@ pub(super) struct GraphGen {
     task_data_to_be_dropped_producer: rtrb::Producer<TaskData>,
     new_task_data_consumer: rtrb::Consumer<TaskData>,
     observability: Arc<ObservabilityState>,
+    settled_graph_generation: Arc<AtomicU64>,
     musical_time_map: Option<Arc<RwLock<MusicalTimeMap>>>,
     transport_clock: Option<super::TransportClock>,
 }
@@ -607,7 +611,10 @@ impl Gen for GraphGen {
                         for td in td_chunk {
                             // Setting `applied` to true signals that the new TaskData have been received and old data can be dropped
                             td.applied.store(true, Ordering::SeqCst);
+                            let generation = td.generation;
                             let old_td = std::mem::replace(&mut self.current_task_data, td);
+                            self.settled_graph_generation
+                                .store(generation, Ordering::SeqCst);
                             match self.task_data_to_be_dropped_producer.push(old_td) {
                           Ok(_) => (),
                           Err(e) => eprintln!("RingBuffer for TaskData to be dropped was full. Please increase the size of the RingBuffer. The GraphGen will drop the TaskData here instead. e: {e}"),
@@ -618,6 +625,7 @@ impl Gen for GraphGen {
 
                 let task_data = &mut self.current_task_data;
                 let TaskData {
+                    generation: _,
                     applied: _,
                     tasks,
                     output_tasks,
