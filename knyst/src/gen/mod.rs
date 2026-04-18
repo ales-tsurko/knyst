@@ -188,6 +188,9 @@ impl<'a, 'b, 'c> GenContext<'a, 'b, 'c> {
 pub enum GenState {
     /// Continue running
     Continue,
+    /// Keep the node alive, but stop calling `process` until an incoming
+    /// scheduled event or parameter change wakes it up again.
+    Sleep,
     /// Free the node containing the Gen
     FreeSelf,
     /// Free the node containing the Gen, bridging its input node(s) to its output node(s).

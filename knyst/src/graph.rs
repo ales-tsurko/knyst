@@ -707,8 +707,18 @@ struct Task {
     /// When a node is scheduled to start a certain sample this will hold that
     /// time in samples at the local Graph sample rate. Otherwise 0.
     start_node_at_sample: u64,
+    sleeping: bool,
 }
 impl Task {
+    #[inline]
+    fn clear_outputs(&mut self) {
+        let mut outputs = NodeBufferRef::new(
+            self.output_buffers_first_ptr,
+            self.num_outputs,
+            self.block_size,
+        );
+        outputs.fill(0.0);
+    }
     #[inline]
     fn init_constants(&mut self) {
         // Copy all constants
@@ -747,7 +757,14 @@ impl Task {
         sample_rate: Sample,
         sample_time_at_block_start: u64,
         transport: Option<crate::gen::TransportContext<'_>>,
+        woke_this_block: bool,
     ) -> GenState {
+        if self.sleeping && !woke_this_block {
+            self.block_events.clear();
+            self.partial_block_events.clear();
+            self.clear_outputs();
+            return GenState::Sleep;
+        }
         // Copy all graph inputs
         for (graph_input_index, node_input_index) in &self.graph_inputs_to_copy {
             for i in 0..self.input_buffers.block_size() {
@@ -801,6 +818,7 @@ impl Task {
             assert!(!self.gen.is_null());
             let state = unsafe { (*self.gen).process(ctx, resources) };
             self.block_events.clear();
+            self.sleeping = matches!(state, GenState::Sleep);
             state
         } else if ((self.start_node_at_sample - sample_time_at_block_start) as usize)
             < self.block_size
@@ -840,6 +858,7 @@ impl Task {
             let state = unsafe { (*self.gen).process(ctx, resources) };
             self.partial_block_events.clear();
             self.block_events.clear();
+            self.sleeping = matches!(state, GenState::Sleep);
             state
         } else {
             // It's not time to run the node yet, just continue
@@ -4227,6 +4246,7 @@ impl Graph {
                 }
                 GenState::FreeGraph(_) | GenState::FreeGraphMendConnections(_) => unreachable!(),
                 GenState::Continue => unreachable!(),
+                GenState::Sleep => unreachable!(),
             }
         }
         // Remove old nodes

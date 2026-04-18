@@ -74,6 +74,7 @@ impl Node {
             block_events: Vec::new(),
             partial_block_events: Vec::new(),
             start_node_at_sample: self.start_node_at_sample,
+            sleeping: false,
         }
     }
     // pub fn name(&self) -> &'static str {

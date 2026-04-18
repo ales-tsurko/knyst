@@ -1487,7 +1487,10 @@ mod tests {
         trig::once_trig,
         KnystError,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
     use std::time::Duration;
 
     fn new_test_controller(errors: Arc<Mutex<Vec<KnystError>>>) -> Controller {
@@ -1557,6 +1560,128 @@ mod tests {
         offline
             .output_channel(channel)
             .is_some_and(|output| output.iter().any(|sample| sample.abs() > 1.0e-4))
+    }
+
+    struct SleepUntilEventGen {
+        awake_blocks_left: usize,
+    }
+
+    impl SleepUntilEventGen {
+        fn new() -> Self {
+            Self {
+                awake_blocks_left: 0,
+            }
+        }
+    }
+
+    impl Gen for SleepUntilEventGen {
+        fn process(&mut self, ctx: GenContext, _resources: &mut Resources) -> GenState {
+            if !ctx.events.is_empty() {
+                self.awake_blocks_left = 1;
+            }
+
+            for channel in ctx.outputs.iter_mut() {
+                channel.fill(0.0);
+            }
+
+            if self.awake_blocks_left > 0 {
+                self.awake_blocks_left -= 1;
+                for channel in ctx.outputs.iter_mut() {
+                    channel.fill(0.5);
+                }
+                GenState::Continue
+            } else {
+                GenState::Sleep
+            }
+        }
+
+        fn num_inputs(&self) -> usize {
+            0
+        }
+
+        fn num_outputs(&self) -> usize {
+            1
+        }
+
+        fn num_event_inputs(&self) -> usize {
+            1
+        }
+
+        fn name(&self) -> &'static str {
+            "SleepUntilEventGen"
+        }
+    }
+
+    struct SleepUntilGainGen;
+
+    impl SleepUntilGainGen {
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    impl Gen for SleepUntilGainGen {
+        fn process(&mut self, ctx: GenContext, _resources: &mut Resources) -> GenState {
+            let gain = ctx.inputs.get_channel(0);
+            let mut any_signal = false;
+            for (gain, out) in gain
+                .iter()
+                .zip(ctx.outputs.iter_mut().next().unwrap().iter_mut())
+            {
+                let sample = if *gain > 0.0 { *gain } else { 0.0 };
+                any_signal |= sample > 0.0;
+                *out = sample;
+            }
+            if any_signal {
+                GenState::Continue
+            } else {
+                GenState::Sleep
+            }
+        }
+
+        fn num_inputs(&self) -> usize {
+            1
+        }
+
+        fn num_outputs(&self) -> usize {
+            1
+        }
+
+        fn name(&self) -> &'static str {
+            "SleepUntilGainGen"
+        }
+    }
+
+    struct CountAndSleepGen {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountAndSleepGen {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl Gen for CountAndSleepGen {
+        fn process(&mut self, ctx: GenContext, _resources: &mut Resources) -> GenState {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            for channel in ctx.outputs.iter_mut() {
+                channel.fill(0.0);
+            }
+            GenState::Sleep
+        }
+
+        fn num_inputs(&self) -> usize {
+            0
+        }
+
+        fn num_outputs(&self) -> usize {
+            1
+        }
+
+        fn name(&self) -> &'static str {
+            "CountAndSleepGen"
+        }
     }
 
     #[test]
@@ -2089,6 +2214,73 @@ mod tests {
         assert!(
             output_has_signal(&offline, 0),
             "settled preexisting gain node went silent after non-zero transport seek"
+        );
+    }
+
+    #[test]
+    fn sleeping_node_wakes_on_event() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 1);
+        let node = offline.context().with_activation(|| {
+            let node = knyst_commands().push(SleepUntilEventGen::new(), inputs![]);
+            knyst_commands().connect(Connection::graph_output(node));
+            node
+        });
+
+        offline.process_block();
+        assert!(
+            !output_has_signal(&offline, 0),
+            "sleeping node should stay silent before an event"
+        );
+
+        knyst_commands()
+            .schedule_event(EventChange::now(node.event_input(0), EventPayload::U32(1)));
+        offline.process_block();
+        assert!(
+            output_has_signal(&offline, 0),
+            "sleeping node did not wake on event delivery"
+        );
+    }
+
+    #[test]
+    fn sleeping_node_wakes_on_parameter_change() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 1);
+        let node = offline.context().with_activation(|| {
+            let node = knyst_commands().push(SleepUntilGainGen::new(), inputs!((0 : 0.0)));
+            knyst_commands().connect(Connection::graph_output(node));
+            node
+        });
+
+        offline.process_block();
+        assert!(
+            !output_has_signal(&offline, 0),
+            "sleeping node should stay silent before a parameter change"
+        );
+
+        knyst_commands().schedule_change(ParameterChange::now(node.input(0), 0.75));
+        offline.process_block();
+        assert!(
+            output_has_signal(&offline, 0),
+            "sleeping node did not wake on parameter change"
+        );
+    }
+
+    #[test]
+    fn sleeping_node_is_not_processed_again_until_woken() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        offline.context().with_activation(|| {
+            let node = knyst_commands().push(CountAndSleepGen::new(calls.clone()), inputs![]);
+            knyst_commands().connect(Connection::graph_output(node));
+        });
+
+        offline.process_block();
+        offline.process_block();
+        offline.process_block();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "sleeping node kept being processed after returning Sleep"
         );
     }
 }

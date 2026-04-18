@@ -249,6 +249,7 @@ impl GraphBlockConverterGen {
             }
             match returned_gen_state {
                 GenState::Continue => (),
+                GenState::Sleep => (),
                 GenState::FreeSelf
                 | GenState::FreeSelfMendConnections
                 | GenState::FreeGraph(_)
@@ -661,6 +662,7 @@ impl Gen for GraphGen {
                     task.init_constants();
                     // If there are any changes to the constants of the node, apply them here
                     let mut i = 0;
+                    let mut woke_this_block = false;
                     while i < changes.len() {
                         let change = &changes[i];
                         if change.key == task.node_key {
@@ -676,6 +678,7 @@ impl Gen for GraphGen {
                             } as usize;
                             if sample_to_apply < self.block_size {
                                 task.apply_scheduled_change(change, sample_to_apply);
+                                woke_this_block = true;
                                 // TODO: This is inefficient since the the first
                                 // changes are the most likely to be removed,
                                 // and are the most expensive to remove. Either
@@ -697,8 +700,10 @@ impl Gen for GraphGen {
                         self.sample_rate,
                         self.sample_counter,
                         block_transport,
+                        woke_this_block,
                     ) {
                         GenState::Continue => (),
+                        GenState::Sleep => (),
                         GenState::FreeSelf => {
                             // We don't care if it fails since if it does the
                             // node will still exist, return FreeSelf and get
@@ -823,7 +828,7 @@ impl Gen for GraphGen {
                 self.sample_counter += self.block_size as u64;
                 self.timestamp.store(self.sample_counter, Ordering::SeqCst);
             }
-            GenState::FreeSelf => {
+            GenState::Sleep | GenState::FreeSelf => {
                 ctx.outputs.fill(0.0);
             }
             GenState::FreeSelfMendConnections => {
