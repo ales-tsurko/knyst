@@ -41,7 +41,7 @@ use crate::{
     KnystError,
 };
 use audio_thread_priority::promote_current_thread_to_real_time;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 const CONTROLLER_ACTIVE_SLEEP: Duration = Duration::from_micros(100);
 const CONTROLLER_IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -71,11 +71,11 @@ enum Command {
     ResourcesCommand(ResourcesCommand),
     ChangeMusicalTimeMap(Box<dyn FnOnce(&mut MusicalTimeMap) + Send>),
     ScheduleBeatCallback(BeatCallback, StartBeat),
-    RequestInspection(std::sync::mpsc::SyncSender<GraphInspection>),
-    RequestGraphSettled(std::sync::mpsc::SyncSender<()>),
-    RequestTransportSettled(std::sync::mpsc::SyncSender<()>),
-    RequestTransportSnapshot(std::sync::mpsc::SyncSender<Option<TransportSnapshot>>),
-    RequestObservabilitySnapshot(std::sync::mpsc::SyncSender<Option<ObservabilitySnapshot>>),
+    RequestInspection(Sender<GraphInspection>),
+    RequestGraphSettled(Sender<()>),
+    RequestTransportSettled(Sender<()>),
+    RequestTransportSnapshot(Sender<Option<TransportSnapshot>>),
+    RequestObservabilitySnapshot(Sender<Option<ObservabilitySnapshot>>),
     TransportPlay,
     TransportPause,
     TransportSeekSeconds(Seconds),
@@ -265,13 +265,13 @@ pub trait KnystCommands {
         change_fn: impl FnOnce(&mut MusicalTimeMap) + Send + 'static,
     );
     /// Request a [`GraphInspection`] of the top level graph which will be sent back in the returned channel
-    fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection>;
+    fn request_inspection(&mut self) -> Receiver<GraphInspection>;
     /// Request a notification when graph topology/task updates submitted before this
     /// call have been applied on the audio thread.
-    fn request_graph_settled(&mut self) -> std::sync::mpsc::Receiver<()>;
+    fn request_graph_settled(&mut self) -> Receiver<()>;
     /// Request a notification when transport updates submitted before this call
     /// have been applied on the audio thread.
-    fn request_transport_settled(&mut self) -> std::sync::mpsc::Receiver<()>;
+    fn request_transport_settled(&mut self) -> Receiver<()>;
     /// Start transport playback.
     fn transport_play(&mut self);
     /// Pause transport playback.
@@ -281,15 +281,11 @@ pub trait KnystCommands {
     /// Seek transport to an absolute beats position.
     fn transport_seek_to_beats(&mut self, position: Beats);
     /// Request current transport state and position.
-    fn request_transport_snapshot(
-        &mut self,
-    ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>>;
+    fn request_transport_snapshot(&mut self) -> Receiver<Option<TransportSnapshot>>;
     /// Return the current transport snapshot without a controller roundtrip.
     fn current_transport_snapshot(&self) -> Option<TransportSnapshot>;
     /// Request current runtime observability metrics.
-    fn request_observability_snapshot(
-        &mut self,
-    ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>>;
+    fn request_observability_snapshot(&mut self) -> Receiver<Option<ObservabilitySnapshot>>;
 
     /// Return the [`GraphSettings`] of the top level graph. This means you
     /// don't have to manually keep track of matching sample rate and block size
@@ -373,6 +369,10 @@ impl MultiThreadedKnystCommands {
     /// Best-effort reporting of backend dropouts/xruns.
     pub(crate) fn report_dropouts(&self, count: u64) {
         let _ = self.send_command(Command::ReportDropouts(count));
+    }
+
+    pub(crate) fn shared_transport_snapshot_state(&self) -> Arc<SharedTransportSnapshotState> {
+        self.transport_snapshot_state.clone()
     }
 }
 
@@ -801,24 +801,24 @@ impl KnystCommands for MultiThreadedKnystCommands {
         }
     }
 
-    fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    fn request_inspection(&mut self) -> Receiver<GraphInspection> {
+        let (sender, receiver) = bounded(1);
         if let Err(error) = self.send_command(Command::RequestInspection(sender)) {
             self.report_error(error);
         }
         receiver
     }
 
-    fn request_graph_settled(&mut self) -> std::sync::mpsc::Receiver<()> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    fn request_graph_settled(&mut self) -> Receiver<()> {
+        let (sender, receiver) = bounded(1);
         if let Err(error) = self.send_command(Command::RequestGraphSettled(sender)) {
             self.report_error(error);
         }
         receiver
     }
 
-    fn request_transport_settled(&mut self) -> std::sync::mpsc::Receiver<()> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    fn request_transport_settled(&mut self) -> Receiver<()> {
+        let (sender, receiver) = bounded(1);
         if let Err(error) = self.send_command(Command::RequestTransportSettled(sender)) {
             self.report_error(error);
         }
@@ -849,10 +849,8 @@ impl KnystCommands for MultiThreadedKnystCommands {
         }
     }
 
-    fn request_transport_snapshot(
-        &mut self,
-    ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    fn request_transport_snapshot(&mut self) -> Receiver<Option<TransportSnapshot>> {
+        let (sender, receiver) = bounded(1);
         if let Err(error) = self.send_command(Command::RequestTransportSnapshot(sender)) {
             self.report_error(error);
         }
@@ -863,10 +861,8 @@ impl KnystCommands for MultiThreadedKnystCommands {
         self.transport_snapshot_state.snapshot()
     }
 
-    fn request_observability_snapshot(
-        &mut self,
-    ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    fn request_observability_snapshot(&mut self) -> Receiver<Option<ObservabilitySnapshot>> {
+        let (sender, receiver) = bounded(1);
         if let Err(error) = self.send_command(Command::RequestObservabilitySnapshot(sender)) {
             self.report_error(error);
         }
@@ -1046,8 +1042,8 @@ pub struct Controller {
     // NodeAddress couldn't be resolved because the node had not yet been
     // pushed.
     command_queue: Vec<(Instant, Command)>,
-    graph_settled_waiters: Vec<(Arc<AtomicU64>, u64, std::sync::mpsc::SyncSender<()>)>,
-    transport_settled_waiters: Vec<(Arc<AtomicU64>, u64, std::sync::mpsc::SyncSender<()>)>,
+    graph_settled_waiters: Vec<(Arc<AtomicU64>, u64, Sender<()>)>,
+    transport_settled_waiters: Vec<(Arc<AtomicU64>, u64, Sender<()>)>,
     error_handler: Box<dyn FnMut(KnystError) + Send>,
     beat_callbacks: Vec<BeatCallback>,
 }
@@ -1254,7 +1250,7 @@ impl Controller {
                 }
             }
             Command::RequestTransportSnapshot(sender) => sender
-                .send(self.top_level_graph.transport_snapshot())
+                .send(self.top_level_graph.shared_transport_snapshot().snapshot())
                 .map_err(|_| ControllerError::TransportSnapshotResponseChannelClosed.into()),
             Command::RequestObservabilitySnapshot(sender) => sender
                 .send(self.top_level_graph.observability_snapshot())
@@ -1509,9 +1505,11 @@ mod tests {
         knyst_commands,
         offline::KnystOffline,
         prelude::*,
+        scheduling::TempoChange,
         trig::once_trig,
         KnystError,
     };
+    use crossbeam_channel::bounded;
     use std::sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -1856,7 +1854,7 @@ mod tests {
     fn request_inspection_reports_dropped_receiver() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
         drop(receiver);
 
         controller.apply_command(Command::RequestInspection(sender));
@@ -1875,7 +1873,7 @@ mod tests {
     fn request_transport_snapshot_reports_dropped_receiver() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
         drop(receiver);
 
         controller.apply_command(Command::RequestTransportSnapshot(sender));
@@ -1894,7 +1892,7 @@ mod tests {
     fn request_graph_settled_reports_dropped_receiver() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
         drop(receiver);
 
         controller.apply_command(Command::RequestGraphSettled(sender));
@@ -1969,7 +1967,7 @@ mod tests {
     fn request_transport_settled_reports_dropped_receiver() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
         drop(receiver);
 
         controller.apply_command(Command::RequestTransportSettled(sender));
@@ -2044,7 +2042,7 @@ mod tests {
     fn request_transport_snapshot_returns_none_without_running_scheduler() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
 
         controller.apply_command(Command::RequestTransportSnapshot(sender));
         let snapshot = receiver
@@ -2102,6 +2100,27 @@ mod tests {
     }
 
     #[test]
+    fn current_transport_snapshot_keeps_reliable_beats_after_tempo_change() {
+        let mut offline = KnystOffline::new(48_000, 64, 0, 2);
+        let mut commands = offline.context().commands();
+
+        commands.change_musical_time_map(|map| {
+            map.replace(0, TempoChange::NewTempo { bpm: 120.0 });
+        });
+        commands.transport_pause();
+        offline.process_block();
+        commands.transport_seek_to_beats(Beats::from_beats(4));
+        offline.process_block();
+
+        let snapshot = commands
+            .current_transport_snapshot()
+            .expect("transport snapshot should be available");
+        assert_eq!(snapshot.state, TransportState::Paused);
+        assert_eq!(snapshot.beats, Some(Beats::from_beats(4)));
+        assert_eq!(snapshot.seconds, Seconds::from_seconds_f64(2.0));
+    }
+
+    #[test]
     fn controller_loop_uses_idle_sleep_without_callbacks_or_waiters() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let controller = new_test_controller(errors);
@@ -2128,7 +2147,7 @@ mod tests {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors);
         let settled = Arc::new(AtomicU64::new(0));
-        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, _receiver) = bounded(1);
         controller.graph_settled_waiters.push((settled, 1, sender));
 
         assert_eq!(
@@ -2141,7 +2160,7 @@ mod tests {
     fn request_observability_snapshot_reports_dropped_receiver() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
         drop(receiver);
 
         controller.apply_command(Command::RequestObservabilitySnapshot(sender));
@@ -2162,7 +2181,7 @@ mod tests {
     fn request_observability_snapshot_returns_none_without_running_scheduler() {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let mut controller = new_test_controller(errors.clone());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = bounded(1);
 
         controller.apply_command(Command::RequestObservabilitySnapshot(sender));
         let snapshot = receiver

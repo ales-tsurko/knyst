@@ -503,57 +503,63 @@ pub(crate) struct SharedTransportSnapshotState {
     state: AtomicU8,
     anchor_engine_samples: AtomicU64,
     anchor_transport_samples: AtomicU64,
+    current_beats_bits: AtomicU64,
+    has_beats: AtomicBool,
     sample_rate: AtomicU64,
     engine_timestamp: OnceLock<Arc<AtomicU64>>,
-    musical_time_map: OnceLock<Arc<RwLock<MusicalTimeMap>>>,
 }
 
 impl SharedTransportSnapshotState {
-    pub(crate) fn initialize(
-        &self,
-        sample_rate: u64,
-        engine_timestamp: Arc<AtomicU64>,
-        musical_time_map: Arc<RwLock<MusicalTimeMap>>,
-    ) {
+    pub(crate) fn initialize(&self, sample_rate: u64, engine_timestamp: Arc<AtomicU64>) {
         let _ = self.engine_timestamp.set(engine_timestamp);
-        let _ = self.musical_time_map.set(musical_time_map);
-        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+        self.sample_rate.store(sample_rate, Ordering::Relaxed);
     }
 
-    fn update_transport(&self, sample_rate: u64, transport: TransportClock) {
-        self.available.store(true, Ordering::SeqCst);
+    fn update_transport(&self, sample_rate: u64, transport: TransportClock, beats: Option<Beats>) {
         self.state
-            .store(transport_state_to_u8(transport.state), Ordering::SeqCst);
+            .store(transport_state_to_u8(transport.state), Ordering::Relaxed);
         self.anchor_engine_samples
-            .store(transport.anchor_engine_samples, Ordering::SeqCst);
+            .store(transport.anchor_engine_samples, Ordering::Relaxed);
         self.anchor_transport_samples
-            .store(transport.anchor_transport_samples, Ordering::SeqCst);
-        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+            .store(transport.anchor_transport_samples, Ordering::Relaxed);
+        match beats {
+            Some(beats) => {
+                self.current_beats_bits
+                    .store(beats.as_beats_f64().to_bits(), Ordering::Relaxed);
+                self.has_beats.store(true, Ordering::Relaxed);
+            }
+            None => {
+                self.has_beats.store(false, Ordering::Relaxed);
+            }
+        }
+        self.sample_rate.store(sample_rate, Ordering::Relaxed);
+        self.available.store(true, Ordering::Release);
     }
 
     pub(crate) fn snapshot(&self) -> Option<TransportSnapshot> {
-        if !self.available.load(Ordering::SeqCst) {
+        if !self.available.load(Ordering::Acquire) {
             return None;
         }
         let engine_timestamp = self.engine_timestamp.get()?;
-        let sample_rate = self.sample_rate.load(Ordering::SeqCst);
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed);
         if sample_rate == 0 {
             return None;
         }
-        let state = transport_state_from_u8(self.state.load(Ordering::SeqCst));
-        let anchor_engine_samples = self.anchor_engine_samples.load(Ordering::SeqCst);
-        let anchor_transport_samples = self.anchor_transport_samples.load(Ordering::SeqCst);
-        let engine_now = engine_timestamp.load(Ordering::SeqCst);
+        let state = transport_state_from_u8(self.state.load(Ordering::Relaxed));
+        let anchor_engine_samples = self.anchor_engine_samples.load(Ordering::Relaxed);
+        let anchor_transport_samples = self.anchor_transport_samples.load(Ordering::Relaxed);
+        let engine_now = engine_timestamp.load(Ordering::Relaxed);
         let samples = match state {
             TransportState::Playing => anchor_transport_samples
                 .saturating_add(engine_now.saturating_sub(anchor_engine_samples)),
             TransportState::Paused => anchor_transport_samples,
         };
         let seconds = Seconds::from_samples(samples, sample_rate);
-        let beats = self
-            .musical_time_map
-            .get()
-            .and_then(|map| map.read().ok().map(|map| map.seconds_to_beats(seconds)));
+        let beats = self.has_beats.load(Ordering::Relaxed).then(|| {
+            Beats::from_beats_f64(f64::from_bits(
+                self.current_beats_bits.load(Ordering::Relaxed),
+            ))
+        });
         Some(TransportSnapshot {
             state,
             samples,
@@ -2255,11 +2261,8 @@ impl Graph {
             }
             let graph_sample_rate =
                 (self.sample_rate * (self.oversampling.as_usize() as Sample)) as u64;
-            self.shared_transport_snapshot.initialize(
-                graph_sample_rate,
-                ggc.timestamp.clone(),
-                musical_time_map.clone(),
-            );
+            self.shared_transport_snapshot
+                .initialize(graph_sample_rate, ggc.timestamp.clone());
             ggc.scheduler.start(
                 self.sample_rate * (self.oversampling.as_usize() as Sample),
                 self.block_size * self.oversampling.as_usize(),
@@ -2277,6 +2280,9 @@ impl Graph {
                         anchor_engine_samples: transport_update.anchor_engine_samples,
                         anchor_transport_samples: transport_update.anchor_transport_samples,
                     },
+                    ggc.scheduler
+                        .transport_snapshot()
+                        .and_then(|snapshot| snapshot.beats),
                 );
             }
         }
@@ -3641,7 +3647,25 @@ impl Graph {
         change_fn: impl FnOnce(&mut MusicalTimeMap),
     ) -> Result<(), ScheduleError> {
         if let Some(ggc) = &mut self.graph_gen_communicator {
-            ggc.scheduler.change_musical_time_map(change_fn)
+            match ggc.scheduler.change_musical_time_map(change_fn) {
+                Ok(()) => {
+                    if let Some(transport_update) = ggc.scheduler.transport_update() {
+                        self.shared_transport_snapshot.update_transport(
+                            transport_update.clock_sample_rate as u64,
+                            TransportClock {
+                                state: transport_update.state,
+                                anchor_engine_samples: transport_update.anchor_engine_samples,
+                                anchor_transport_samples: transport_update.anchor_transport_samples,
+                            },
+                            ggc.scheduler
+                                .transport_snapshot()
+                                .and_then(|snapshot| snapshot.beats),
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         } else {
             Err(ScheduleError::SchedulerNotCreated)
         }
@@ -3661,6 +3685,9 @@ impl Graph {
                         anchor_engine_samples: transport_update.anchor_engine_samples,
                         anchor_transport_samples: transport_update.anchor_transport_samples,
                     },
+                    ggc.scheduler
+                        .transport_snapshot()
+                        .and_then(|snapshot| snapshot.beats),
                 );
             }
             Ok(())
@@ -3683,6 +3710,9 @@ impl Graph {
                         anchor_engine_samples: transport_update.anchor_engine_samples,
                         anchor_transport_samples: transport_update.anchor_transport_samples,
                     },
+                    ggc.scheduler
+                        .transport_snapshot()
+                        .and_then(|snapshot| snapshot.beats),
                 );
             }
             Ok(())
@@ -3705,6 +3735,9 @@ impl Graph {
                         anchor_engine_samples: transport_update.anchor_engine_samples,
                         anchor_transport_samples: transport_update.anchor_transport_samples,
                     },
+                    ggc.scheduler
+                        .transport_snapshot()
+                        .and_then(|snapshot| snapshot.beats),
                 );
             }
             Ok(())
@@ -3727,6 +3760,9 @@ impl Graph {
                         anchor_engine_samples: transport_update.anchor_engine_samples,
                         anchor_transport_samples: transport_update.anchor_transport_samples,
                     },
+                    ggc.scheduler
+                        .transport_snapshot()
+                        .and_then(|snapshot| snapshot.beats),
                 );
             }
             Ok(())
@@ -4128,6 +4164,7 @@ impl Graph {
             arc_inputs_buffers_ptr: self.inputs_buffers_ptr.clone(),
             observability,
             settled_graph_generation: graph_gen_communicator.settled_graph_generation.clone(),
+            shared_transport_snapshot: self.shared_transport_snapshot.clone(),
         });
         self.graph_gen_communicator = Some(graph_gen_communicator);
         Ok(graph_gen)
@@ -4763,6 +4800,7 @@ impl Scheduler {
             },
         }
     }
+
     /// Schedules a change to be applied at the time of calling the function + the latency setting.
     fn schedule_now(&mut self, key: NodeKey, change: ScheduledChangeKind) {
         let _ = self.schedule(

@@ -10,7 +10,8 @@ use crate::{internal_filter::hiir::StandardDownsampler2X, scheduling::MusicalTim
 
 use super::{
     node::Node, Gen, GenContext, GenState, NodeBufferRef, NodeId, NodeKey, ObservabilityState,
-    Oversampling, OwnedRawBuffer, Sample, ScheduleReceiver, SharedNodeStorage, TaskData,
+    Oversampling, OwnedRawBuffer, Sample, ScheduleReceiver, SharedNodeStorage,
+    SharedTransportSnapshotState, TaskData,
 };
 
 pub(super) struct GraphGenBuildArgs {
@@ -32,6 +33,7 @@ pub(super) struct GraphGenBuildArgs {
     pub arc_inputs_buffers_ptr: Arc<OwnedRawBuffer>,
     pub observability: Arc<ObservabilityState>,
     pub settled_graph_generation: Arc<AtomicU64>,
+    pub shared_transport_snapshot: Arc<SharedTransportSnapshotState>,
 }
 
 pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
@@ -54,6 +56,7 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         arc_inputs_buffers_ptr,
         observability,
         settled_graph_generation,
+        shared_transport_snapshot,
     } = args;
 
     let graph_gen = Box::new(GraphGen {
@@ -73,6 +76,7 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         _arc_inputs_buffers_ptr: arc_inputs_buffers_ptr,
         observability,
         settled_graph_generation,
+        shared_transport_snapshot,
         musical_time_map: None,
         transport_clock: None,
     });
@@ -575,6 +579,7 @@ pub(super) struct GraphGen {
     new_task_data_consumer: rtrb::Consumer<TaskData>,
     observability: Arc<ObservabilityState>,
     settled_graph_generation: Arc<AtomicU64>,
+    shared_transport_snapshot: Arc<SharedTransportSnapshotState>,
     musical_time_map: Option<Arc<RwLock<MusicalTimeMap>>>,
     transport_clock: Option<super::TransportClock>,
 }
@@ -656,6 +661,20 @@ impl Gen for GraphGen {
                         )
                     })
                 };
+                if let Some(transport_clock) = self.transport_clock {
+                    let block_start_samples = transport_clock.position_samples(self.sample_counter);
+                    let beats = musical_time_map_guard.as_deref().map(|map| {
+                        map.seconds_to_beats(crate::time::Seconds::from_samples(
+                            block_start_samples,
+                            self.sample_rate as u64,
+                        ))
+                    });
+                    self.shared_transport_snapshot.update_transport(
+                        self.sample_rate as u64,
+                        transport_clock,
+                        beats,
+                    );
+                }
 
                 // Run the tasks
                 for task in tasks.iter_mut() {

@@ -30,14 +30,17 @@ use crate::wavetable_aa::Wavetable;
 #[derive(Clone)]
 pub struct SharedKnystCommands {
     commands: Arc<Mutex<MultiThreadedKnystCommands>>,
+    transport_snapshot_state: Arc<crate::graph::SharedTransportSnapshotState>,
 }
 
 impl SharedKnystCommands {
     /// Create a shared command handle from raw multithreaded commands.
     #[must_use]
     pub fn new(commands: MultiThreadedKnystCommands) -> Self {
+        let transport_snapshot_state = commands.shared_transport_snapshot_state();
         Self {
             commands: Arc::new(Mutex::new(commands)),
+            transport_snapshot_state,
         }
     }
 
@@ -162,15 +165,15 @@ impl KnystCommands for SharedKnystCommands {
         self.lock().change_musical_time_map(change_fn);
     }
 
-    fn request_inspection(&mut self) -> std::sync::mpsc::Receiver<GraphInspection> {
+    fn request_inspection(&mut self) -> crossbeam_channel::Receiver<GraphInspection> {
         self.lock().request_inspection()
     }
 
-    fn request_graph_settled(&mut self) -> std::sync::mpsc::Receiver<()> {
+    fn request_graph_settled(&mut self) -> crossbeam_channel::Receiver<()> {
         self.lock().request_graph_settled()
     }
 
-    fn request_transport_settled(&mut self) -> std::sync::mpsc::Receiver<()> {
+    fn request_transport_settled(&mut self) -> crossbeam_channel::Receiver<()> {
         self.lock().request_transport_settled()
     }
 
@@ -192,17 +195,17 @@ impl KnystCommands for SharedKnystCommands {
 
     fn request_transport_snapshot(
         &mut self,
-    ) -> std::sync::mpsc::Receiver<Option<TransportSnapshot>> {
+    ) -> crossbeam_channel::Receiver<Option<TransportSnapshot>> {
         self.lock().request_transport_snapshot()
     }
 
     fn current_transport_snapshot(&self) -> Option<TransportSnapshot> {
-        self.lock().current_transport_snapshot()
+        self.transport_snapshot_state.snapshot()
     }
 
     fn request_observability_snapshot(
         &mut self,
-    ) -> std::sync::mpsc::Receiver<Option<ObservabilitySnapshot>> {
+    ) -> crossbeam_channel::Receiver<Option<ObservabilitySnapshot>> {
         self.lock().request_observability_snapshot()
     }
 
