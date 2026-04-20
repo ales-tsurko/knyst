@@ -10,8 +10,9 @@ use crate::{internal_filter::hiir::StandardDownsampler2X, scheduling::MusicalTim
 
 use super::{
     node::Node, Gen, GenContext, GenState, NodeBufferRef, NodeId, NodeKey, ObservabilityState,
-    Oversampling, OwnedRawBuffer, Sample, ScheduleReceiver, SharedNodeStorage,
-    SharedTransportSnapshotState, TaskData,
+    Oversampling, OwnedRawBuffer, Sample, ScheduleReceiver, SchedulerChange, SchedulerExtension,
+    SchedulerExtensionContext, SchedulerExtensionUpdate, SharedNodeStorage,
+    SharedTransportSnapshotState, TaskData, TransportSnapshot,
 };
 
 pub(super) struct GraphGenBuildArgs {
@@ -34,6 +35,8 @@ pub(super) struct GraphGenBuildArgs {
     pub observability: Arc<ObservabilityState>,
     pub settled_graph_generation: Arc<AtomicU64>,
     pub shared_transport_snapshot: Arc<SharedTransportSnapshotState>,
+    pub scheduler_extension: Option<Box<dyn SchedulerExtension>>,
+    pub scheduler_extension_update_consumer: rtrb::Consumer<SchedulerExtensionUpdate>,
 }
 
 pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
@@ -57,6 +60,8 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         observability,
         settled_graph_generation,
         shared_transport_snapshot,
+        scheduler_extension,
+        scheduler_extension_update_consumer,
     } = args;
 
     let graph_gen = Box::new(GraphGen {
@@ -77,6 +82,9 @@ pub(super) fn make_graph_gen(args: GraphGenBuildArgs) -> Box<dyn Gen + Send> {
         observability,
         settled_graph_generation,
         shared_transport_snapshot,
+        scheduler_extension,
+        scheduler_extension_update_consumer,
+        scheduler_extension_changes: Vec::new(),
         musical_time_map: None,
         transport_clock: None,
     });
@@ -580,8 +588,28 @@ pub(super) struct GraphGen {
     observability: Arc<ObservabilityState>,
     settled_graph_generation: Arc<AtomicU64>,
     shared_transport_snapshot: Arc<SharedTransportSnapshotState>,
+    scheduler_extension: Option<Box<dyn SchedulerExtension>>,
+    scheduler_extension_update_consumer: rtrb::Consumer<SchedulerExtensionUpdate>,
+    scheduler_extension_changes: Vec<SchedulerChange>,
     musical_time_map: Option<Arc<RwLock<MusicalTimeMap>>>,
     transport_clock: Option<super::TransportClock>,
+}
+
+fn block_transport_snapshot(
+    sample_rate: Sample,
+    transport_clock: Option<super::TransportClock>,
+    musical_time_map: Option<&MusicalTimeMap>,
+    sample_counter: u64,
+) -> Option<TransportSnapshot> {
+    let transport_clock = transport_clock?;
+    let samples = transport_clock.position_samples(sample_counter);
+    let seconds = crate::time::Seconds::from_samples(samples, sample_rate as u64);
+    Some(TransportSnapshot {
+        state: transport_clock.state,
+        samples,
+        seconds,
+        beats: musical_time_map.map(|map| map.seconds_to_beats(seconds)),
+    })
 }
 
 impl Gen for GraphGen {
@@ -607,6 +635,16 @@ impl Gen for GraphGen {
                 {
                     self.transport_clock = Some(transport_clock);
                     self.musical_time_map = Some(musical_time_map);
+                }
+                while let Ok(update) = self.scheduler_extension_update_consumer.pop() {
+                    match update {
+                        SchedulerExtensionUpdate::Set(scheduler_extension) => {
+                            self.scheduler_extension = Some(scheduler_extension);
+                        }
+                        SchedulerExtensionUpdate::Clear => {
+                            self.scheduler_extension = None;
+                        }
+                    }
                 }
                 let mut do_empty_buffer = None;
                 let mut do_mend_connections = None;
@@ -674,6 +712,75 @@ impl Gen for GraphGen {
                         transport_clock,
                         beats,
                     );
+                }
+                let scheduler_transport = block_transport_snapshot(
+                    self.sample_rate,
+                    self.transport_clock,
+                    musical_time_map_guard.as_deref(),
+                    self.sample_counter,
+                );
+                if let Some(extension) = self.scheduler_extension.as_mut() {
+                    self.scheduler_extension_changes.clear();
+                    extension.collect_block_changes(
+                        &SchedulerExtensionContext {
+                            block_size: self.block_size,
+                            sample_rate: self.sample_rate,
+                            transport: scheduler_transport,
+                        },
+                        &mut self.scheduler_extension_changes,
+                    );
+                    for change in self.scheduler_extension_changes.drain(..) {
+                        match change {
+                            SchedulerChange::Parameter {
+                                target,
+                                sample_offset,
+                                value,
+                            } if sample_offset < self.block_size => {
+                                changes.push(super::ScheduledChange {
+                                    timestamp: self.sample_counter + sample_offset as u64,
+                                    generation: 0,
+                                    key: target.node_key,
+                                    kind: super::ScheduledChangeKind::Constant {
+                                        index: target.input_index,
+                                        value: match value {
+                                            super::Change::Constant(value) => value,
+                                            super::Change::Trigger => {
+                                                changes.push(super::ScheduledChange {
+                                                    timestamp: self.sample_counter
+                                                        + sample_offset as u64,
+                                                    generation: 0,
+                                                    key: target.node_key,
+                                                    kind: super::ScheduledChangeKind::Trigger {
+                                                        index: target.input_index,
+                                                    },
+                                                    removal_countdown: 0,
+                                                });
+                                                continue;
+                                            }
+                                        },
+                                    },
+                                    removal_countdown: 0,
+                                });
+                            }
+                            SchedulerChange::Event {
+                                target,
+                                sample_offset,
+                                payload,
+                            } if sample_offset < self.block_size => {
+                                changes.push(super::ScheduledChange {
+                                    timestamp: self.sample_counter + sample_offset as u64,
+                                    generation: 0,
+                                    key: target.node_key,
+                                    kind: super::ScheduledChangeKind::Event {
+                                        index: target.event_input_index,
+                                        payload,
+                                    },
+                                    removal_countdown: 0,
+                                });
+                            }
+                            _ => (),
+                        }
+                    }
                 }
 
                 // Run the tasks

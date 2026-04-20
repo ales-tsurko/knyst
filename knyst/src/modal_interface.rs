@@ -14,10 +14,12 @@ use crate::buffer::Buffer;
 use crate::controller::{
     CallbackHandle, KnystCommands, MultiThreadedKnystCommands, StartBeat, UploadGraphError,
 };
+use crate::graph::connection::NodeInput;
 use crate::graph::connection::{ConnectionBundle, InputBundle};
 use crate::graph::{
-    Connection, EventChange, GenOrGraph, GraphId, GraphSettings, NodeId, ObservabilitySnapshot,
-    ParameterChange, SimultaneousChanges, Time, TransportSnapshot,
+    Connection, EventChange, GenOrGraph, GraphId, GraphSettings, NodeEventInput, NodeId,
+    ObservabilitySnapshot, ParameterChange, ResolvedNodeEventInput, ResolvedNodeInput,
+    SchedulerExtension, SimultaneousChanges, Time, TransportSnapshot,
 };
 use crate::handles::{GraphHandle, Handle};
 use crate::inspection::GraphInspection;
@@ -207,6 +209,28 @@ impl KnystCommands for SharedKnystCommands {
         &mut self,
     ) -> crossbeam_channel::Receiver<Option<ObservabilitySnapshot>> {
         self.lock().request_observability_snapshot()
+    }
+
+    fn resolve_scheduler_input(
+        &mut self,
+        input: NodeInput,
+    ) -> crossbeam_channel::Receiver<Option<ResolvedNodeInput>> {
+        self.lock().resolve_scheduler_input(input)
+    }
+
+    fn resolve_scheduler_event_input(
+        &mut self,
+        input: NodeEventInput,
+    ) -> crossbeam_channel::Receiver<Option<ResolvedNodeEventInput>> {
+        self.lock().resolve_scheduler_event_input(input)
+    }
+
+    fn set_scheduler_extension(&mut self, scheduler_extension: Box<dyn SchedulerExtension>) {
+        self.lock().set_scheduler_extension(scheduler_extension);
+    }
+
+    fn clear_scheduler_extension(&mut self) {
+        self.lock().clear_scheduler_extension();
     }
 
     fn default_graph_settings(&self) -> GraphSettings {

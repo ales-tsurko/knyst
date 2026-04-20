@@ -10,8 +10,9 @@ pub use crate::graph::{
     connection::constant,
     connection::{ConnectionBundle, InputBundle},
     gen, BlockEvent, Connection, EventChange, EventPayload, Graph, GraphInput, GraphSettings, Mult,
-    NodeId, ObservabilitySnapshot, ParameterChange, RunGraphSettings, TransportSnapshot,
-    TransportState,
+    NodeId, NodeKey, ObservabilitySnapshot, ParameterChange, ResolvedNodeEventInput,
+    ResolvedNodeInput, RunGraphSettings, SchedulerChange, SchedulerExtension,
+    SchedulerExtensionContext, TransportSnapshot, TransportState,
 };
 pub use crate::handles::{
     bus, graph_input, graph_output, handle, GenericHandle, GraphHandle, Handle, HandleData,

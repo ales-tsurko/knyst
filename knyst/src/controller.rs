@@ -20,7 +20,8 @@ use std::{
 use crate::{
     buffer::Buffer,
     graph::{
-        EventChange, NodeChanges, ObservabilitySnapshot, ScheduleError, Time, TransportSnapshot,
+        EventChange, NodeChanges, ObservabilitySnapshot, ResolvedNodeEventInput, ResolvedNodeInput,
+        ScheduleError, SchedulerExtension, Time, TransportSnapshot,
     },
     inspection::GraphInspection,
     knyst_commands,
@@ -30,9 +31,9 @@ use crate::{
 };
 use crate::{
     graph::{
-        connection::{ConnectionBundle, ConnectionError, InputBundle},
-        Connection, FreeError, GenOrGraph, GenOrGraphEnum, Graph, GraphId, GraphSettings, NodeId,
-        ParameterChange, SharedTransportSnapshotState, SimultaneousChanges,
+        connection::{ConnectionBundle, ConnectionError, InputBundle, NodeInput},
+        Connection, FreeError, GenOrGraph, GenOrGraphEnum, Graph, GraphId, GraphSettings,
+        NodeEventInput, NodeId, ParameterChange, SharedTransportSnapshotState, SimultaneousChanges,
     },
     handles::{GraphHandle, Handle},
     inputs,
@@ -76,6 +77,10 @@ enum Command {
     RequestTransportSettled(Sender<()>),
     RequestTransportSnapshot(Sender<Option<TransportSnapshot>>),
     RequestObservabilitySnapshot(Sender<Option<ObservabilitySnapshot>>),
+    RequestResolvedNodeInput(NodeInput, Sender<Option<ResolvedNodeInput>>),
+    RequestResolvedNodeEventInput(NodeEventInput, Sender<Option<ResolvedNodeEventInput>>),
+    SetSchedulerExtension(Box<dyn SchedulerExtension>),
+    ClearSchedulerExtension,
     TransportPlay,
     TransportPause,
     TransportSeekSeconds(Seconds),
@@ -135,6 +140,14 @@ impl std::fmt::Debug for Command {
                 .debug_tuple("RequestObservabilitySnapshot")
                 .field(arg0)
                 .finish(),
+            Self::RequestResolvedNodeInput(_arg0, _arg1) => {
+                f.debug_tuple("RequestResolvedNodeInput").finish()
+            }
+            Self::RequestResolvedNodeEventInput(_arg0, _arg1) => {
+                f.debug_tuple("RequestResolvedNodeEventInput").finish()
+            }
+            Self::SetSchedulerExtension(_arg0) => f.debug_tuple("SetSchedulerExtension").finish(),
+            Self::ClearSchedulerExtension => write!(f, "ClearSchedulerExtension"),
             Self::TransportPlay => write!(f, "TransportPlay"),
             Self::TransportPause => write!(f, "TransportPause"),
             Self::TransportSeekSeconds(arg0) => {
@@ -286,6 +299,17 @@ pub trait KnystCommands {
     fn current_transport_snapshot(&self) -> Option<TransportSnapshot>;
     /// Request current runtime observability metrics.
     fn request_observability_snapshot(&mut self) -> Receiver<Option<ObservabilitySnapshot>>;
+    /// Resolve a node input into a realtime-safe target for [`SchedulerExtension`].
+    fn resolve_scheduler_input(&mut self, input: NodeInput) -> Receiver<Option<ResolvedNodeInput>>;
+    /// Resolve a node event input into a realtime-safe target for [`SchedulerExtension`].
+    fn resolve_scheduler_event_input(
+        &mut self,
+        input: NodeEventInput,
+    ) -> Receiver<Option<ResolvedNodeEventInput>>;
+    /// Install or replace the current [`SchedulerExtension`].
+    fn set_scheduler_extension(&mut self, scheduler_extension: Box<dyn SchedulerExtension>);
+    /// Remove the current [`SchedulerExtension`].
+    fn clear_scheduler_extension(&mut self);
 
     /// Return the [`GraphSettings`] of the top level graph. This means you
     /// don't have to manually keep track of matching sample rate and block size
@@ -869,6 +893,38 @@ impl KnystCommands for MultiThreadedKnystCommands {
         receiver
     }
 
+    fn resolve_scheduler_input(&mut self, input: NodeInput) -> Receiver<Option<ResolvedNodeInput>> {
+        let (sender, receiver) = bounded(1);
+        if let Err(error) = self.send_command(Command::RequestResolvedNodeInput(input, sender)) {
+            self.report_error(error);
+        }
+        receiver
+    }
+
+    fn resolve_scheduler_event_input(
+        &mut self,
+        input: NodeEventInput,
+    ) -> Receiver<Option<ResolvedNodeEventInput>> {
+        let (sender, receiver) = bounded(1);
+        if let Err(error) = self.send_command(Command::RequestResolvedNodeEventInput(input, sender))
+        {
+            self.report_error(error);
+        }
+        receiver
+    }
+
+    fn set_scheduler_extension(&mut self, scheduler_extension: Box<dyn SchedulerExtension>) {
+        if let Err(error) = self.send_command(Command::SetSchedulerExtension(scheduler_extension)) {
+            self.report_error(error);
+        }
+    }
+
+    fn clear_scheduler_extension(&mut self) {
+        if let Err(error) = self.send_command(Command::ClearSchedulerExtension) {
+            self.report_error(error);
+        }
+    }
+
     fn to_graph(&mut self, graph_id: GraphId) {
         self.selected_graph_remote_graph = graph_id;
     }
@@ -1255,6 +1311,21 @@ impl Controller {
             Command::RequestObservabilitySnapshot(sender) => sender
                 .send(self.top_level_graph.observability_snapshot())
                 .map_err(|_| ControllerError::ObservabilitySnapshotResponseChannelClosed.into()),
+            Command::RequestResolvedNodeInput(input, sender) => sender
+                .send(self.top_level_graph.resolve_scheduler_input(input))
+                .map_err(|_| ControllerError::InspectionResponseChannelClosed.into()),
+            Command::RequestResolvedNodeEventInput(input, sender) => sender
+                .send(self.top_level_graph.resolve_scheduler_event_input(input))
+                .map_err(|_| ControllerError::InspectionResponseChannelClosed.into()),
+            Command::SetSchedulerExtension(scheduler_extension) => {
+                self.top_level_graph
+                    .set_scheduler_extension_boxed(scheduler_extension);
+                Ok(())
+            }
+            Command::ClearSchedulerExtension => {
+                self.top_level_graph.clear_scheduler_extension();
+                Ok(())
+            }
             Command::TransportPlay => self.top_level_graph.transport_play().map_err(From::from),
             Command::TransportPause => self.top_level_graph.transport_pause().map_err(From::from),
             Command::TransportSeekSeconds(position) => self

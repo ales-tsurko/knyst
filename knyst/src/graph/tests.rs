@@ -10,7 +10,7 @@ use super::{Gen, RunGraph};
 use crate as knyst;
 use crate::controller::KnystCommands;
 use crate::gen::{BufferReader, WavetableOscillatorOwned};
-use crate::graph::{FreeError, Oversampling, ScheduleError};
+use crate::graph::{Change, FreeError, Oversampling, ScheduleError};
 use crate::prelude::*;
 use crate::scheduling::{TempoChange, TempoCurve, TempoCurveSegment};
 use crate::time::{Beats, Seconds};
@@ -78,6 +78,52 @@ impl Gen for EventEchoGen {
 
     fn name(&self) -> &'static str {
         "EventEchoGen"
+    }
+}
+
+struct OneShotEventExtension {
+    target: ResolvedNodeEventInput,
+    fired: bool,
+}
+
+impl SchedulerExtension for OneShotEventExtension {
+    fn collect_block_changes(
+        &mut self,
+        _ctx: &SchedulerExtensionContext,
+        out: &mut Vec<SchedulerChange>,
+    ) {
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        out.push(SchedulerChange::Event {
+            target: self.target,
+            sample_offset: 3,
+            payload: EventPayload::F32(3.0),
+        });
+    }
+}
+
+struct OneShotParameterExtension {
+    target: ResolvedNodeInput,
+    fired: bool,
+}
+
+impl SchedulerExtension for OneShotParameterExtension {
+    fn collect_block_changes(
+        &mut self,
+        _ctx: &SchedulerExtensionContext,
+        out: &mut Vec<SchedulerChange>,
+    ) {
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        out.push(SchedulerChange::Parameter {
+            target: self.target,
+            sample_offset: 2,
+            value: Change::Constant(0.75),
+        });
     }
 }
 #[impl_gen]
@@ -160,6 +206,69 @@ fn scheduled_events_are_delivered_at_block_sample_offsets() {
     assert_eq!(output[5], 2.0);
     assert_eq!(output[6], 0.0);
     assert_eq!(output[7], 0.0);
+}
+
+#[test]
+fn scheduler_extension_emits_block_local_events() {
+    let mut graph = Graph::new(GraphSettings {
+        block_size: 8,
+        num_outputs: 1,
+        sample_rate: 8.0,
+        ..GraphSettings::default()
+    });
+    let node_id = graph.push(EventEchoGen);
+    graph.connect(Connection::graph_output(node_id)).unwrap();
+    let target = graph
+        .resolve_scheduler_event_input(node_id.event_input("event"))
+        .unwrap();
+    graph.set_scheduler_extension(OneShotEventExtension {
+        target,
+        fired: false,
+    });
+
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..RunGraphSettings::default()
+        },
+    );
+    run_graph.process_block();
+
+    let output = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(output[3], 3.0);
+}
+
+#[test]
+fn scheduler_extension_emits_block_local_parameter_changes() {
+    let mut graph = Graph::new(GraphSettings {
+        block_size: 8,
+        num_outputs: 1,
+        sample_rate: 8.0,
+        ..GraphSettings::default()
+    });
+    let node_id = graph.push(ValueGen);
+    graph.connect(Connection::graph_output(node_id)).unwrap();
+    let target = graph.resolve_scheduler_input(node_id.input(0)).unwrap();
+    graph.set_scheduler_extension(OneShotParameterExtension {
+        target,
+        fired: false,
+    });
+
+    let mut run_graph = test_run_graph(
+        &mut graph,
+        RunGraphSettings {
+            scheduling_latency: Duration::ZERO,
+            ..RunGraphSettings::default()
+        },
+    );
+    run_graph.process_block();
+
+    let output = run_graph.graph_output_buffers().get_channel(0);
+    assert_eq!(output[0], 0.0);
+    assert_eq!(output[1], 0.0);
+    assert_eq!(output[2], 0.75);
+    assert_eq!(output[7], 0.75);
 }
 #[test]
 fn multiple_nodes() {

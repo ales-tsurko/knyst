@@ -352,6 +352,96 @@ pub struct BlockEvent {
     pub payload: EventPayload,
 }
 
+/// A resolved node input target for advanced realtime scheduling APIs.
+///
+/// Resolve this once on the control thread using [`Graph::resolve_scheduler_input`]
+/// or [`KnystCommands::resolve_scheduler_input`], then reuse it from a
+/// [`SchedulerExtension`] without any audio-thread lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedNodeInput {
+    /// Target node.
+    pub node_key: NodeKey,
+    /// Target input index on the node.
+    pub input_index: usize,
+}
+
+/// A resolved node event input target for advanced realtime scheduling APIs.
+///
+/// Resolve this once on the control thread using
+/// [`Graph::resolve_scheduler_event_input`] or
+/// [`KnystCommands::resolve_scheduler_event_input`], then reuse it from a
+/// [`SchedulerExtension`] without any audio-thread lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedNodeEventInput {
+    /// Target node.
+    pub node_key: NodeKey,
+    /// Target event input index on the node.
+    pub event_input_index: usize,
+}
+
+/// One block-local change emitted by a [`SchedulerExtension`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchedulerChange {
+    /// Apply a parameter change at a sample offset in the current block.
+    Parameter {
+        /// Resolved target input.
+        target: ResolvedNodeInput,
+        /// Sample offset inside the current block.
+        sample_offset: usize,
+        /// Value to apply.
+        value: Change,
+    },
+    /// Deliver an event payload at a sample offset in the current block.
+    Event {
+        /// Resolved target event input.
+        target: ResolvedNodeEventInput,
+        /// Sample offset inside the current block.
+        sample_offset: usize,
+        /// Event payload.
+        payload: EventPayload,
+    },
+}
+
+/// Timing information for one audio block passed to a [`SchedulerExtension`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SchedulerExtensionContext {
+    /// Current block size in samples.
+    pub block_size: usize,
+    /// Current graph sample rate.
+    pub sample_rate: Sample,
+    /// Current transport position at the start of the block, if transport is available.
+    pub transport: Option<TransportSnapshot>,
+}
+
+/// Advanced realtime scheduling hook called on the audio thread once per block.
+///
+/// Use this when a host or engine already owns a timeline and wants Knyst to
+/// apply the resulting parameter changes or events sample-accurately inside the
+/// current block without relying on a separate polling thread.
+///
+/// Typical uses:
+/// - step sequencers
+/// - song/event timelines
+/// - sample-accurate block-local automation
+/// - algorithmic event generation tied to transport position
+///
+/// Targets should be resolved ahead of time on the control thread using
+/// [`Graph::resolve_scheduler_input`] or
+/// [`Graph::resolve_scheduler_event_input`] (or the equivalent
+/// [`KnystCommands`] helpers), then reused here.
+pub trait SchedulerExtension: Send {
+    /// Append any changes/events that belong to the current block.
+    ///
+    /// The implementation should treat `out` as scratch storage supplied by
+    /// Knyst and simply push block-local changes into it. Each `sample_offset`
+    /// must be strictly less than `ctx.block_size`.
+    fn collect_block_changes(
+        &mut self,
+        ctx: &SchedulerExtensionContext,
+        out: &mut Vec<SchedulerChange>,
+    );
+}
+
 impl From<f32> for Change {
     fn from(value: f32) -> Self {
         Self::Constant(value as Sample)
@@ -1249,8 +1339,12 @@ impl Gen for ClosureGen {
 }
 
 new_key_type! {
-    /// Node identifier in a specific Graph. For referring to a Node outside of the context of a Graph, use NodeId instead.
-    struct NodeKey;
+    /// Stable internal node identifier inside one specific running graph.
+    ///
+    /// This is mainly useful for advanced realtime APIs such as
+    /// [`SchedulerExtension`]. For normal graph construction and routing, use
+    /// [`NodeId`] instead.
+    pub struct NodeKey;
 }
 
 /// Describes the oversampling applied to a graph
@@ -1494,6 +1588,7 @@ pub struct Graph {
     max_node_inputs: usize,
     graph_gen_communicator: Option<GraphGenCommunicator>,
     shared_transport_snapshot: Arc<SharedTransportSnapshotState>,
+    scheduler_extension: Option<Box<dyn SchedulerExtension>>,
     /// For storing changes made before the graph is started. When the GraphGen is created, the changes will be scheduled on the scheduler.
     scheduled_changes_queue: Vec<QueuedScheduledChanges>,
 }
@@ -1561,6 +1656,7 @@ impl Graph {
             ring_buffer_size,
             graph_gen_communicator: None,
             shared_transport_snapshot: Arc::new(SharedTransportSnapshotState::default()),
+            scheduler_extension: None,
             recalculation_required: false,
             buffers_to_free_when_safe: vec![],
             new_inputs_buffers_ptr: false,
@@ -1571,6 +1667,48 @@ impl Graph {
 
     pub(crate) fn shared_transport_snapshot(&self) -> Arc<SharedTransportSnapshotState> {
         self.shared_transport_snapshot.clone()
+    }
+
+    /// Resolve a [`NodeInput`] into a realtime-safe target for a [`SchedulerExtension`].
+    #[must_use]
+    pub fn resolve_scheduler_input(&self, input: NodeInput) -> Option<ResolvedNodeInput> {
+        self.resolve_scheduler_input_internal(input)
+    }
+
+    /// Resolve a [`NodeEventInput`] into a realtime-safe target for a [`SchedulerExtension`].
+    #[must_use]
+    pub fn resolve_scheduler_event_input(
+        &self,
+        input: NodeEventInput,
+    ) -> Option<ResolvedNodeEventInput> {
+        self.resolve_scheduler_event_input_internal(input)
+    }
+
+    /// Install or replace the current [`SchedulerExtension`].
+    pub fn set_scheduler_extension(
+        &mut self,
+        scheduler_extension: impl SchedulerExtension + 'static,
+    ) {
+        self.set_scheduler_extension_boxed(Box::new(scheduler_extension));
+    }
+
+    /// Remove the current [`SchedulerExtension`].
+    pub fn clear_scheduler_extension(&mut self) {
+        self.scheduler_extension = None;
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.clear_scheduler_extension();
+        }
+    }
+
+    pub(crate) fn set_scheduler_extension_boxed(
+        &mut self,
+        scheduler_extension: Box<dyn SchedulerExtension>,
+    ) {
+        if let Some(ggc) = &mut self.graph_gen_communicator {
+            ggc.set_scheduler_extension(scheduler_extension);
+        } else {
+            self.scheduler_extension = Some(scheduler_extension);
+        }
     }
     /// Create a node that will run this graph. This will fail if a Node or Gen has already been created from the Graph since only one Gen is allowed to exist per Graph.
     ///
@@ -1948,6 +2086,33 @@ impl Graph {
             .iter()
             .find(|(_key, &id)| id == node_id)
             .map(|(key, _id)| key)
+    }
+    fn resolve_scheduler_input_internal(&self, input: NodeInput) -> Option<ResolvedNodeInput> {
+        let key = Self::key_from_id(&self.node_ids, input.node)?;
+        let input_index = match input.channel {
+            NodeChannel::Label(label) => *self.node_input_name_to_index[key].get(label)?,
+            NodeChannel::Index(index) => index,
+        };
+        (input_index < self.node_input_index_to_name[key].len()).then_some(ResolvedNodeInput {
+            node_key: key,
+            input_index,
+        })
+    }
+    fn resolve_scheduler_event_input_internal(
+        &self,
+        input: NodeEventInput,
+    ) -> Option<ResolvedNodeEventInput> {
+        let key = Self::key_from_id(&self.node_ids, input.node)?;
+        let event_input_index = match input.channel {
+            NodeChannel::Label(label) => *self.node_event_input_name_to_index[key].get(label)?,
+            NodeChannel::Index(index) => index,
+        };
+        (event_input_index < self.node_event_input_index_to_name[key].len()).then_some(
+            ResolvedNodeEventInput {
+                node_key: key,
+                event_input_index,
+            },
+        )
     }
     fn id_from_key(&self, node_key: NodeKey) -> Option<NodeId> {
         self.node_ids.get(node_key).copied()
@@ -4107,6 +4272,8 @@ impl Graph {
         let (scheduled_change_producer, rb_consumer) = RingBuffer::new(scheduler_buffer_size);
         let (clock_update_producer, clock_update_consumer) = RingBuffer::new(10);
         let (transport_update_producer, transport_update_consumer) = RingBuffer::new(10);
+        let (scheduler_extension_update_producer, scheduler_extension_update_consumer) =
+            RingBuffer::new(8);
         let settled_graph_generation = Arc::new(AtomicU64::new(0));
         let settled_transport_generation = Arc::new(AtomicU64::new(0));
         let schedule_generation = match &scheduler {
@@ -4141,6 +4308,7 @@ impl Graph {
             next_transport_generation: 0,
             task_data_to_be_dropped_consumer,
             new_task_data_producer,
+            scheduler_extension_update_producer,
             next_change_flag: task_data.applied.clone(),
             timestamp: Arc::new(AtomicU64::new(0)),
             observability: observability.clone(),
@@ -4165,6 +4333,8 @@ impl Graph {
             observability,
             settled_graph_generation: graph_gen_communicator.settled_graph_generation.clone(),
             shared_transport_snapshot: self.shared_transport_snapshot.clone(),
+            scheduler_extension: self.scheduler_extension.take(),
+            scheduler_extension_update_consumer,
         });
         self.graph_gen_communicator = Some(graph_gen_communicator);
         Ok(graph_gen)
@@ -4997,6 +5167,11 @@ struct TaskData {
     new_inputs_buffers_ptr: Option<Arc<OwnedRawBuffer>>,
 }
 
+enum SchedulerExtensionUpdate {
+    Set(Box<dyn SchedulerExtension>),
+    Clear,
+}
+
 struct GraphGenCommunicator {
     // The number of updates applied to this GraphGen. Add by
     // `updates_available` every time it finishes a block. It is a u16 so that
@@ -5025,6 +5200,7 @@ struct GraphGenCommunicator {
     free_node_queue_consumer: rtrb::Consumer<(NodeKey, GenState)>,
     task_data_to_be_dropped_consumer: rtrb::Consumer<TaskData>,
     new_task_data_producer: rtrb::Producer<TaskData>,
+    scheduler_extension_update_producer: rtrb::Producer<SchedulerExtensionUpdate>,
 }
 
 unsafe impl Send for GraphGenCommunicator {}
@@ -5051,6 +5227,18 @@ impl GraphGenCommunicator {
     fn send_transport_update(&mut self, transport_update: TransportUpdate) {
         self.transport_update_producer
             .push(transport_update)
+            .unwrap();
+    }
+
+    fn set_scheduler_extension(&mut self, scheduler_extension: Box<dyn SchedulerExtension>) {
+        self.scheduler_extension_update_producer
+            .push(SchedulerExtensionUpdate::Set(scheduler_extension))
+            .unwrap();
+    }
+
+    fn clear_scheduler_extension(&mut self) {
+        self.scheduler_extension_update_producer
+            .push(SchedulerExtensionUpdate::Clear)
             .unwrap();
     }
 
