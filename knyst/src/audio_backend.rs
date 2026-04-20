@@ -116,6 +116,9 @@ pub enum AudioBackendError {
     CpalDefaultStreamConfigError(#[from] cpal::DefaultStreamConfigError),
     #[cfg(feature = "cpal")]
     #[error(transparent)]
+    CpalSupportedStreamConfigsError(#[from] cpal::SupportedStreamConfigsError),
+    #[cfg(feature = "cpal")]
+    #[error(transparent)]
     CpalStreamError(#[from] cpal::StreamError),
     #[cfg(feature = "cpal")]
     #[error(transparent)]
@@ -129,6 +132,9 @@ pub enum AudioBackendError {
     #[cfg(feature = "cpal")]
     #[error("Unsupported CPAL sample format: {0:?}")]
     UnsupportedSampleFormat(cpal::SampleFormat),
+    #[cfg(feature = "cpal")]
+    #[error("Unsupported CPAL configuration: {0}")]
+    UnsupportedCpalConfiguration(String),
     #[cfg(feature = "cpal")]
     #[error(
         "CPAL input overflow: dropped {dropped_samples} sample(s) because the input queue was full."
@@ -612,6 +618,8 @@ pub mod cpal_backend {
     pub struct CpalBackendOptions {
         pub device: String,
         pub verbose: bool,
+        pub sample_rate: Option<u32>,
+        pub block_size: Option<u32>,
     }
 
     impl Default for CpalBackendOptions {
@@ -619,6 +627,8 @@ pub mod cpal_backend {
             Self {
                 device: "default".into(),
                 verbose: false,
+                sample_rate: None,
+                block_size: None,
             }
         }
     }
@@ -634,6 +644,7 @@ pub mod cpal_backend {
         sample_rate: usize,
         config: cpal::SupportedStreamConfig,
         device: cpal::Device,
+        preferred_block_size: Option<usize>,
     }
 
     impl CpalBackend {
@@ -648,20 +659,46 @@ pub mod cpal_backend {
                 host.output_devices()?
                     .find(|x| x.name().map(|y| y == options.device).unwrap_or(false))
             }
-            .ok_or(AudioBackendError::OutputDeviceNotFound(selected_device))?;
+            .ok_or(AudioBackendError::OutputDeviceNotFound(
+                selected_device.clone(),
+            ))?;
             if options.verbose {
                 println!("Output device: {}", device.name()?);
             }
 
-            let config = device.default_output_config()?;
+            let default_config = device.default_output_config()?;
+            let config = if let Some(sample_rate) = options.sample_rate {
+                if default_config.sample_rate().0 == sample_rate {
+                    default_config
+                } else {
+                    let requested = cpal::SampleRate(sample_rate);
+                    let selected_range = device
+                        .supported_output_configs()?
+                        .filter(|config| {
+                            config.min_sample_rate().0 <= sample_rate
+                                && sample_rate <= config.max_sample_rate().0
+                        })
+                        .max_by(|left, right| left.cmp_default_heuristics(right))
+                        .ok_or_else(|| {
+                            AudioBackendError::UnsupportedCpalConfiguration(format!(
+                                "requested sample rate {sample_rate} Hz is not supported by {}",
+                                device.name().unwrap_or_else(|_| selected_device.clone())
+                            ))
+                        })?;
+                    selected_range.with_sample_rate(requested)
+                }
+            } else {
+                default_config
+            };
             if options.verbose {
-                println!("Default output config: {:?}", config);
+                println!("Output config: {:?}", config);
             }
             Ok(Self {
                 streams: None,
                 sample_rate: config.sample_rate().0 as usize,
                 config,
                 device,
+                preferred_block_size: options.block_size.map(|value| value as usize),
             })
         }
         /// The number of outputs for the device's default output config
@@ -745,7 +782,23 @@ pub mod cpal_backend {
                 (None, None)
             };
 
-            let stream_config: cpal::StreamConfig = output_config.clone().into();
+            let mut stream_config: cpal::StreamConfig = output_config.clone().into();
+            if let Some(block_size) = self.preferred_block_size {
+                let requested = block_size as u32;
+                match output_config.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => {
+                        if requested < *min || requested > *max {
+                            return Err(AudioBackendError::UnsupportedCpalConfiguration(format!(
+                                "requested block size {requested} is outside supported range {min}..={max}"
+                            )));
+                        }
+                        stream_config.buffer_size = cpal::BufferSize::Fixed(requested);
+                    }
+                    cpal::SupportedBufferSize::Unknown => {
+                        stream_config.buffer_size = cpal::BufferSize::Fixed(requested);
+                    }
+                }
+            }
             let graph_input_channels = graph_inputs;
             let (run_graph, resources_command_sender, resources_command_receiver) =
                 RunGraph::new(&mut graph, resources, run_graph_settings)?;
@@ -947,7 +1000,7 @@ pub mod cpal_backend {
         }
 
         fn block_size(&self) -> Option<usize> {
-            None
+            self.preferred_block_size
         }
 
         fn native_output_channels(&self) -> Option<usize> {
